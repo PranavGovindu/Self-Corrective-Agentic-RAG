@@ -1,62 +1,50 @@
 import streamlit as st
-import PyPDF2
-from docx import Document
+from agents.orchestrator import Orchestrator
+from config.load_config import load_config
 
-st.title("AI Assistant with RAG + Web Search")
+config = load_config()
+orchestrator = Orchestrator()
 
-st.sidebar.title("Configuration")
-retrieval_method = st.sidebar.radio("Choose retrieval method:", ["RAG + Web", "RAG Only", "Web Only"])
+st.markdown("""
+    <style>
+    .stChatInput {position: fixed; bottom: 20px; width: 70%;}
+    .stMarkdown {padding: 10px; border-radius: 5px;}
+    div[data-testid="stExpander"] {border: 1px solid rgba(49, 51, 63, 0.2);}
+    </style>
+    """, unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader("Upload a file (optional):", type=["txt", "pdf", "docx"])
-query = st.text_input("Ask your question:", placeholder="Type your query here...")
+with st.sidebar:
+    st.title("Settings ⚙️")
+    web_search_enabled = st.checkbox("Enable Web Search", value=False)
+    st.markdown("---")
+    st.markdown("**Models**")
+    st.write(f"LLM: {config['ollama']['model']}")
+    st.write(f"Embeddings: {config['embedding']['model']}")
 
-if st.button("Submit"):
-    if query.strip():
-        with st.spinner("Processing your query..."):
-            response = "Generated response will appear here."
-            sources = ["Source 1: Example.com", "Source 2: Wikipedia"]
-            plan = {
-                "steps": [
-                    "1. Check if the uploaded file contains relevant context.",
-                    "2. Search RAG for relevant information.",
-                    "3. Perform web search for additional sources.",
-                    "4. Combine results from RAG and web search.",
-                    "5. Generate the final response."
-                ]
-            }
+st.title("🔍 Open Source RAG Explorer")
+st.caption("Powered by Ollama + Qdrant")
 
-        with st.expander("Plan of Action (Click to expand)"):
-            for step in plan["steps"]:
-                st.markdown(f"- {step}")
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-        st.subheader("Response")
-        st.write(response)
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-        st.subheader("Sources")
-        for i, source in enumerate(sources, 1):
-            st.markdown(f"{i}. {source}")
-    else:
-        st.warning("Please enter a valid query.")
+user_query = st.chat_input("Ask a question...")
 
-if uploaded_file is not None:
-    st.subheader("Uploaded File Content")
-    file_extension = uploaded_file.name.split(".")[-1]
+if user_query:
+    st.session_state.messages.append({"role": "user", "content": user_query})
+    with st.chat_message("user"):
+        st.markdown(user_query)
 
-    try:
-        if file_extension == "txt":
-            content = uploaded_file.read().decode("utf-8")
-            st.text_area("File Content Preview", value=content, height=200)
-        elif file_extension == "pdf":
-            pdf_reader = PyPDF2.PdfReader(uploaded_file)
-            pdf_text = ""
-            for page in pdf_reader.pages:
-                pdf_text += page.extract_text()
-            st.text_area("File Content Preview", value=pdf_text, height=200)
-        elif file_extension == "docx":
-            doc = Document(uploaded_file)
-            doc_text = "\n".join([para.text for para in doc.paragraphs])
-            st.text_area("File Content Preview", value=doc_text, height=200)
-        else:
-            st.error("Unsupported file format.")
-    except Exception as e:
-        st.error(f"Error processing the file: {e}")
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            thought_process, final_answer = orchestrator.run_with_thought_process(user_query, web_search_enabled)
+            st.markdown("### 🤔 Thought Process")
+            for step in thought_process:
+                with st.expander(f"**Step {step['step']}**: {step['description']}"):
+                    st.write(step["details"])
+            st.markdown("### 🎯 Final Answer")
+            st.markdown(final_answer)
+            st.session_state.messages.append({"role": "assistant", "content": final_answer})
