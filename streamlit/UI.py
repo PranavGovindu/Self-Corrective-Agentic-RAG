@@ -24,17 +24,26 @@ with st.sidebar:
 st.title("🔍 Open Source RAG Explorer")
 st.caption("Powered by Ollama + Qdrant")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+uploaded_file = st.file_uploader("Upload a document (PDF or TXT)", type=["pdf", "txt"])
+if uploaded_file:
+    file_path = f"data/documents/{uploaded_file.name}"
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    with st.spinner("Processing document..."):
+        result = orchestrator.ingest_document(file_path)
+        st.success(result)
 
-for message in st.session_state.messages:
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+for message in st.session_state.chat_history:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 user_query = st.chat_input("Ask a question...")
 
 if user_query:
-    st.session_state.messages.append({"role": "user", "content": user_query})
+    st.session_state.chat_history.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.markdown(user_query)
 
@@ -47,4 +56,9 @@ if user_query:
                     st.write(step["details"])
             st.markdown("### 🎯 Final Answer")
             st.markdown(final_answer)
-            st.session_state.messages.append({"role": "assistant", "content": final_answer})
+            st.session_state.chat_history.append({"role": "assistant", "content": final_answer})
+
+st.markdown("### Chat History")
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
