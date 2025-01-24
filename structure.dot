@@ -25,9 +25,8 @@ digraph G {
     "config" -> "agents.yaml";
     "config" -> "retrieval.yaml";
     "config" -> "paths.yaml";
-    "interface" -> "cli.py";
+    "interface" -> "ui.py";
     "tests" -> "test_retrieval.py";
     "tests" -> "test_agents.py";
-    "docker-compose.yml";
     "requirements.txt";
 }
