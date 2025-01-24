@@ -21,7 +21,7 @@ with st.sidebar:
     st.write(f"LLM: {config['ollama']['model']}")
     st.write(f"Embeddings: {config['embedding']['model']}")
 
-st.title("🔍 Open Source RAG Explorer")
+st.title(" Open Source RAG Explorer")
 st.caption("Powered by Ollama + Qdrant")
 
 uploaded_file = st.file_uploader("Upload a document (PDF or TXT)", type=["pdf", "txt"])
@@ -50,7 +50,7 @@ if user_query:
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             thought_process, final_answer = orchestrator.run_with_thought_process(user_query, web_search_enabled)
-            st.markdown("### 🤔 Thought Process")
+            st.markdown("###  Thought Process")
             for step in thought_process:
                 with st.expander(f"**Step {step['step']}**: {step['description']}"):
                     st.write(step["details"])
