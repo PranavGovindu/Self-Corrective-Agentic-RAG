@@ -1,0 +1,33 @@
+digraph G {
+    node [shape=box];
+
+    "agentic-rag" -> "core";
+    "core" -> "agents";
+    "core" -> "retrieval";
+    "core" -> "generation";
+    "core" -> "graph";
+    "agents" -> "orchestrator.py";
+    "agents" -> "planner.py";
+    "agents" -> "reflector.py";
+    "agents" -> "web_searcher.py";
+    "retrieval" -> "hybrid_engine.py";
+    "retrieval" -> "graph_retriever.py";
+    "retrieval" -> "web_retriever.py";
+    "retrieval" -> "reranker.py";
+    "retrieval" -> "fusion.py";
+    "generation" -> "llm_gateway.py";
+    "generation" -> "response_builder.py";
+    "graph" -> "builder.py";
+    "graph" -> "queries.cypher";
+    "data" -> "documents";
+    "data" -> "vector_db";
+    "data" -> "knowledge_graph";
+    "config" -> "agents.yaml";
+    "config" -> "retrieval.yaml";
+    "config" -> "paths.yaml";
+    "interface" -> "cli.py";
+    "tests" -> "test_retrieval.py";
+    "tests" -> "test_agents.py";
+    "docker-compose.yml";
+    "requirements.txt";
+}
