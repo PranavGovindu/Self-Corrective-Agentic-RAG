@@ -2,3 +2,5 @@ streamlit
 PyPDF2
 python-docx
 docling
+langchain
+langchain-core
