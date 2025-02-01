@@ -1,6 +1,20 @@
-streamlit
-PyPDF2
-python-docx
-docling
+# Core dependencies
 langchain
-langchain-core
+langchain-community
+langchain-huggingface
+langchain-pinecone
+langchain-ollama
+
+# Vector store and embeddings
+pinecone-client
+transformers
+torch
+sentence-transformers
+
+# Web scraping and parsing
+beautifulsoup4
+requests
+
+# Additional utilities
+python-dotenv
+typing-extensions
