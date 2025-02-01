@@ -165,65 +165,103 @@ class RAGS:
         return [doc_map[key] for key, score in reranked]
 
     def setup_rag_chain(self):
-        # Modified query rewrite template to be more direct
+        # Query rewrite template remains the same
         query_rewrite_template = """You are a helpful assistant that rewrites queries to make them clearer and more specific.
 Given the query below, rewrite it to be more detailed and search-friendly. Do not ask for clarification - just improve the query.
 
 Original Query: {question}
 
 Rewritten Query: """
-        
+    
         prompt_rewrite = ChatPromptTemplate.from_template(query_rewrite_template)
         rewrite_query_chain = prompt_rewrite | self.llm | StrOutputParser()
 
-        # Modified multi-query template to focus on generating related queries
-        multi_query_generation_template = """Given the search query below, generate 4 different but related search queries that could help find relevant information.
-Each query should explore a different aspect of the topic. Output exactly 4 queries, one per line.
+        # Modified multi-query template to enforce better formatting
+        multi_query_generation_template = """Generate 4 different search queries related to the topic below. Each query should explore a different aspect.
+Format your response exactly as shown, with one query per line and no prefixes or extra text.
 
-Search Query: {rewritten_query}
+Topic: {rewritten_query}
 
-Queries:"""
-        
+1.
+2.
+3.
+4."""
+    
         prompt_multi_query = ChatPromptTemplate.from_template(multi_query_generation_template)
+    
+        def parse_queries(raw_output: str) -> List[str]:
+            # Split by newlines and clean up
+            lines = [line.strip() for line in raw_output.split('\n')]
+            # Filter out empty lines and numbered prefixes
+            queries = [
+                line.strip().lstrip('1234567890. ') 
+                for line in lines 
+                if line.strip() and not line.lower().startswith(('topic:', 'queries:', 'sure', 'please'))
+            ]
+            # Ensure we have valid queries
+            return [q for q in queries if len(q) > 10]  # Basic length validation
+    
         multi_query_chain = (
             prompt_multi_query
             | self.llm
             | StrOutputParser()
-            | (lambda x: [q.strip() for q in x.split('\n') if q.strip() and not q.startswith('Queries:')])
+            | parse_queries
         )
 
-        def generate_queries(query_dict: dict):
-            rewritten_query = rewrite_query_chain.invoke(query_dict)
-            logger.info(f"Rewritten Query: {rewritten_query}")
-            raw_queries = multi_query_chain.invoke({"rewritten_query": rewritten_query})
-            logger.info(f"Raw Generated Queries: {raw_queries}")
-            queries = [q for q in raw_queries if not q.lower().startswith(('sure', 'please', 'queries', 'query'))]
-            if not queries:
-                logger.warning("No valid queries generated, using original query")
-                return [query_dict["question"]]
-            logger.info(f"Valid Generated Queries: {queries}")
-            return queries
+        def generate_queries(query_dict: dict) -> List[str]:
+            try:
+                # Get rewritten query
+                rewritten_query = rewrite_query_chain.invoke(query_dict)
+                logger.info(f"Rewritten Query: {rewritten_query}")
+            
+                # Generate multiple queries
+                raw_queries = multi_query_chain.invoke({"rewritten_query": rewritten_query})
+                logger.info(f"Raw Generated Queries: {raw_queries}")
+            
+                # Validate generated queries
+                if not raw_queries:
+                    logger.warning("No valid queries generated, using original and rewritten queries")
+                    return [query_dict["question"], rewritten_query]
+            
+                # Add original rewritten query to ensure it's included
+                queries = [rewritten_query] + raw_queries
+            
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_queries = [q for q in queries if not (q in seen or seen.add(q))]
+            
+                logger.info(f"Final Queries: {unique_queries}")
+                return unique_queries
+            except Exception as e:
+                logger.error(f"Error in query generation: {str(e)}")
+                return [query_dict["question"]]  # Fallback to original question
 
-        def retrieve_all(queries):
+        def retrieve_all(queries: List[str]) -> List[List[Document]]:
             all_results = []
             for query in queries:
-                logger.info(f"Retrieving documents for sub-query: '{query}'")
-                results = self.hybrid_retrieve_for_query(query)
-                if results:  # Only add non-empty result lists
-                    all_results.append(results)
+                try:
+                    logger.info(f"Retrieving documents for query: '{query}'")
+                    results = self.hybrid_retrieve_for_query(query)
+                    if results:
+                        all_results.append(results)
+                except Exception as e:
+                    logger.error(f"Error retrieving results for query '{query}': {str(e)}")
             return all_results
 
-        def fuse_results(query_dict: dict):
+        def fuse_results(query_dict: dict) -> List[Document]:
             queries = generate_queries(query_dict)
-            logger.info(f"Generated queries: {queries}")
+            logger.info(f"Processing queries: {queries}")
+        
             retrieved_lists = retrieve_all(queries)
             if not retrieved_lists:
                 logger.warning("No results found for any query")
                 return []
+            
             fused_docs = self.reciprocal_rank_fusion(retrieved_lists)
-            logger.info(f"Total fused documents after RRF: {len(fused_docs)}")
+            logger.info(f"Total fused documents: {len(fused_docs)}")
             return fused_docs
 
+        # Final answer template remains largely the same but with improved formatting
         final_template = """You are an expert assistant tasked with providing detailed, accurate, and well-structured answers based on the given context. If you don't find relevant information in the context, say "I don't have enough information to answer this question accurately."
 
 Context:
@@ -234,7 +272,7 @@ Question: {question}
 Instructions:
 1. If the context contains relevant information, provide a detailed answer (200+ words)
 2. Include specific examples and details from the context
-3. Structure your answer with clear sections
+3. Structure your answer with clear sections and headers
 4. Use natural language and avoid unnecessary jargon
 5. Begin with a clear introduction and end with a key takeaway
 
