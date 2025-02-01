@@ -2,8 +2,9 @@ import os
 import getpass
 import time
 import logging
-from typing import List
+from typing import List, Union
 from operator import itemgetter
+import hashlib
 
 import bs4
 from langchain import hub
@@ -16,16 +17,11 @@ from langchain_ollama import OllamaLLM
 from langchain_pinecone import PineconeVectorStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import ChatPromptTemplate, PromptTemplate
-from langchain.load import dumps, loads
 from pinecone import Pinecone, ServerlessSpec
-
-# For BM25 retrieval
 from rank_bm25 import BM25Okapi
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 class RAGS:
     def __init__(
@@ -35,32 +31,20 @@ class RAGS:
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
     ):
-        """Initialize RAG system with Pinecone, BM25, and Ollama."""
         self.index_name = index_name
         self.embedding_model = embedding_model
         self.llm_model = llm_model
         self.dimension = dimension
-
-        # Initialize Pinecone
         self.setup_pinecone()
-
-        # Initialize embeddings and vector store (dense search)
         self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
         self.vector_store = PineconeVectorStore(index=self.index, embedding=self.embeddings)
         self.retriever = self.vector_store.as_retriever()
-
-        # Initialize BM25 components (sparse search)
-        self.bm25_corpus = []  # list of document texts
+        self.bm25_corpus = []
         self.bm25 = None
-
-        # Initialize LLM
         self.llm = OllamaLLM(model=self.llm_model)
-
-        # Setup RAG chain (includes query rewriting and final answer generation)
         self.setup_rag_chain()
 
     def setup_pinecone(self):
-        """Initialize Pinecone and create index if it doesn't exist."""
         if not os.getenv("PINECONE_API_KEY"):
             os.environ["PINECONE_API_KEY"] = getpass.getpass("Enter your Pinecone API key: ")
 
@@ -76,7 +60,6 @@ class RAGS:
                     metric="cosine",
                     spec=ServerlessSpec(cloud="aws", region="us-east-1"),
                 )
-                # Wait for index to be ready
                 while not self.pc.describe_index(self.index_name).status["ready"]:
                     time.sleep(1)
                     logger.info("Waiting for index to be ready...")
@@ -87,7 +70,6 @@ class RAGS:
             raise Exception(f"Failed to initialize Pinecone: {str(e)}")
 
     def load_web_content(self, urls: List[str]) -> List[Document]:
-        """Load and process content from web URLs."""
         try:
             loader = WebBaseLoader(
                 web_paths=urls,
@@ -117,122 +99,157 @@ class RAGS:
         except Exception as e:
             raise Exception(f"Failed to load web content: {str(e)}")
 
-    @staticmethod
-    def format_docs(docs: List[Document]) -> str:
-        """Format retrieved documents into a single string."""
-        return "\n\n".join(doc.page_content for doc in docs)
+    # Modified to handle both Document objects and strings
+    def format_docs(self, docs: List[Union[Document, str]]) -> str:
+        formatted_docs = []
+        for doc in docs:
+            if isinstance(doc, Document):
+                formatted_docs.append(doc.page_content)
+            elif isinstance(doc, str):
+                formatted_docs.append(doc)
+            else:
+                logger.warning(f"Skipping document of unexpected type: {type(doc)}")
+        
+        return "\n\n".join(formatted_docs)
 
     def bm25_retrieve(self, query: str, top_k: int = 5) -> List[Document]:
-        """Retrieve documents using BM25 for a single query."""
         if not self.bm25:
             logger.warning("BM25 index not initialized.")
             return []
         tokenized_query = query.split()
         scores = self.bm25.get_scores(tokenized_query)
         top_docs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
-        logger.info(f"BM25 retrieved {len(top_docs)} documents for query: '{query}'")
         return [Document(page_content=self.bm25_corpus[idx]) for idx, _ in top_docs]
 
     def hybrid_retrieve_for_query(self, query: str) -> List[Document]:
-        """Retrieve documents using both Pinecone and BM25 for a given query and fuse the results."""
         logger.info(f"Hybrid retrieval for query: '{query}'")
         pinecone_results = self.retriever.invoke(query)
         logger.info(f"Pinecone retrieved {len(pinecone_results)} documents for query: '{query}'")
+        
+        # Added explicit conversion of Pinecone results to Documents
+        pinecone_results = [
+            Document(page_content=result.page_content) if isinstance(result, Document) 
+            else Document(page_content=result) if isinstance(result, str)
+            else result
+            for result in pinecone_results
+        ]
+        
         bm25_results = self.bm25_retrieve(query)
         logger.info(f"BM25 retrieved {len(bm25_results)} documents for query: '{query}'")
         fused = self.reciprocal_rank_fusion([pinecone_results, bm25_results])
         logger.info(f"Fused result contains {len(fused)} documents for query: '{query}'")
         return fused
 
+    # Modified to handle document type conversion and validation
     @staticmethod
-    def reciprocal_rank_fusion(results: List[List[Document]], k: int = 60) -> List[Document]:
-        """Reciprocal Rank Fusion (RRF) to rerank multiple lists of documents."""
+    def reciprocal_rank_fusion(results: List[List[Union[Document, str]]], k: int = 60) -> List[Document]:
         fused_scores = {}
-        for docs in results:
-            for rank, doc in enumerate(docs):
-                doc_str = dumps(doc)
-                if doc_str not in fused_scores:
-                    fused_scores[doc_str] = 0
-                fused_scores[doc_str] += 1 / (rank + k)
-        reranked_docs = [
-            (loads(doc), score)
-            for doc, score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
-        ]
-        return [doc for doc, _ in reranked_docs]
+        doc_map = {}
+
+        for result_list in results:
+            for rank, doc in enumerate(result_list):
+                if not isinstance(doc, (Document, str)):
+                    logger.warning(f"Skipping invalid document type: {type(doc)}")
+                    continue
+                
+                if isinstance(doc, str):
+                    doc = Document(page_content=doc)
+
+                key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
+                if key not in fused_scores:
+                    fused_scores[key] = 0
+                    doc_map[key] = doc
+                fused_scores[key] += 1 / (rank + k)
+
+        reranked = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+        return [doc_map[key] for key, score in reranked]
 
     def setup_rag_chain(self):
-        """Setup the RAG chain with query rewriting, multi-query generation, hybrid retrieval, and final answer generation."""
-        # Step 1: Query Rewriting
-        query_rewrite_template = (
-            "You are a helpful assistant that rewrites queries to make them clearer and more precise.\n"
-            "Rewrite the following query:\n\n"
-            "Original Query: {question}\n"
-            "Rewritten Query:"
-        )
+        # Modified query rewrite template to be more direct
+        query_rewrite_template = """You are a helpful assistant that rewrites queries to make them clearer and more specific.
+Given the query below, rewrite it to be more detailed and search-friendly. Do not ask for clarification - just improve the query.
+
+Original Query: {question}
+
+Rewritten Query: """
+        
         prompt_rewrite = ChatPromptTemplate.from_template(query_rewrite_template)
         rewrite_query_chain = prompt_rewrite | self.llm | StrOutputParser()
 
-        # Step 2: Multi-Query Generation (using the rewritten query)
-        multi_query_generation_template = (
-            "You are an assistant that generates multiple search queries based on a given rewritten query.\n"
-            "Generate 4 distinct search queries related to:\n\n"
-            "Rewritten Query: {rewritten_query}\n"
-            "Output (one query per line):"
-        )
+        # Modified multi-query template to focus on generating related queries
+        multi_query_generation_template = """Given the search query below, generate 4 different but related search queries that could help find relevant information.
+Each query should explore a different aspect of the topic. Output exactly 4 queries, one per line.
+
+Search Query: {rewritten_query}
+
+Queries:"""
+        
         prompt_multi_query = ChatPromptTemplate.from_template(multi_query_generation_template)
         multi_query_chain = (
             prompt_multi_query
             | self.llm
             | StrOutputParser()
-            | (lambda x: x.split("\n"))
+            | (lambda x: [q.strip() for q in x.split('\n') if q.strip() and not q.startswith('Queries:')])
         )
 
-        # Combine both steps into a single chain
-        # Assign the chain to generate_queries so it can be invoked later.
-        generate_queries = {"rewritten_query": rewrite_query_chain} | multi_query_chain
+        def generate_queries(query_dict: dict):
+            rewritten_query = rewrite_query_chain.invoke(query_dict)
+            logger.info(f"Rewritten Query: {rewritten_query}")
+            raw_queries = multi_query_chain.invoke({"rewritten_query": rewritten_query})
+            logger.info(f"Raw Generated Queries: {raw_queries}")
+            queries = [q for q in raw_queries if not q.lower().startswith(('sure', 'please', 'queries', 'query'))]
+            if not queries:
+                logger.warning("No valid queries generated, using original query")
+                return [query_dict["question"]]
+            logger.info(f"Valid Generated Queries: {queries}")
+            return queries
 
         def retrieve_all(queries):
             all_results = []
             for query in queries:
                 logger.info(f"Retrieving documents for sub-query: '{query}'")
                 results = self.hybrid_retrieve_for_query(query)
-                all_results.append(results)
+                if results:  # Only add non-empty result lists
+                    all_results.append(results)
             return all_results
 
         def fuse_results(query_dict: dict):
-            # Generate multiple queries from the original question
-            queries = generate_queries.invoke(query_dict)
-            logger.info(f"Rewritten and generated queries: {queries}")
+            queries = generate_queries(query_dict)
+            logger.info(f"Generated queries: {queries}")
             retrieved_lists = retrieve_all(queries)
+            if not retrieved_lists:
+                logger.warning("No results found for any query")
+                return []
             fused_docs = self.reciprocal_rank_fusion(retrieved_lists)
             logger.info(f"Total fused documents after RRF: {len(fused_docs)}")
             return fused_docs
 
-        final_template = (
-            """
-You are an expert assistant tasked with providing detailed, accurate, and well-structured answers to questions based on the given context. Follow these guidelines:
-If you don't know the answer, just say that you don't know. 
-1. **Understand the Context**: Carefully analyze the provided context to ensure your answer is relevant and accurate.
-2. **Answer in Detail**: Provide a comprehensive answer with a minimum of 200 words. Include examples, explanations, and supporting details where applicable.
-3. **Structure Your Answer**:
-    - Start with a brief introduction summarizing the key points.
-    - Use bullet points or numbered lists for clarity if the answer involves steps, features, or categories.
-    - Conclude with a summary or key takeaway.
-4. **Be Clear and Concise**: Avoid unnecessary jargon or overly complex language. Ensure the answer is easy to understand.
-5. **Cite the Context**: If specific details from the context are used, mention them explicitly to support your answer.
+        final_template = """You are an expert assistant tasked with providing detailed, accurate, and well-structured answers based on the given context. If you don't find relevant information in the context, say "I don't have enough information to answer this question accurately."
 
 Context:
 {context}
 
 Question: {question}
-            """
-        )
+
+Instructions:
+1. If the context contains relevant information, provide a detailed answer (200+ words)
+2. Include specific examples and details from the context
+3. Structure your answer with clear sections
+4. Use natural language and avoid unnecessary jargon
+5. Begin with a clear introduction and end with a key takeaway
+
+Answer:"""
+
         prompt_final = ChatPromptTemplate.from_template(final_template)
 
-        # Create final chain that fuses the results and then generates an answer.
+        context_chain = (
+            RunnablePassthrough(fuse_results) 
+            | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
+        )
+
         self.final_rag_chain = (
             {
-                "context": fuse_results | (lambda docs: self.format_docs(docs)),
+                "context": context_chain,
                 "question": itemgetter("question"),
             }
             | prompt_final
@@ -241,15 +258,14 @@ Question: {question}
         )
 
     def query(self, question: str) -> str:
-        """Query the RAG system with a question."""
         try:
             logger.info(f"Original Question: {question}")
             answer = self.final_rag_chain.invoke({"question": question})
             logger.info(f"Final Answer: {answer}")
             return answer
         except Exception as e:
+            logger.error(f"Error: {str(e)}")
             raise Exception(f"Failed to process query: {str(e)}")
-
 
 if __name__ == "__main__":
     rag = RAGS()
