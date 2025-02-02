@@ -23,6 +23,8 @@ from rank_bm25 import BM25Okapi
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+#inspired from langchain cookbooks,mistral and huggingface
+
 class RAGS:
     def __init__(
         self,
@@ -126,7 +128,7 @@ class RAGS:
         pinecone_results = self.retriever.invoke(query)
         logger.info(f"Pinecone retrieved {len(pinecone_results)} documents for query: '{query}'")
         
-        # Added explicit conversion of Pinecone results to Documents
+        #  explicit conversion of Pinecone results to Documents(claude wooo)
         pinecone_results = [
             Document(page_content=result.page_content) if isinstance(result, Document) 
             else Document(page_content=result) if isinstance(result, str)
@@ -140,12 +142,11 @@ class RAGS:
         logger.info(f"Fused result contains {len(fused)} documents for query: '{query}'")
         return fused
 
-    # Modified to handle document type conversion and validation
     @staticmethod
     def reciprocal_rank_fusion(results: List[List[Union[Document, str]]], k: int = 60) -> List[Document]:
         fused_scores = {}
         doc_map = {}
-
+        #open source code for reciprocal rank fusion(no cohere)
         for result_list in results:
             for rank, doc in enumerate(result_list):
                 if not isinstance(doc, (Document, str)):
@@ -165,7 +166,6 @@ class RAGS:
         return [doc_map[key] for key, score in reranked]
 
     def setup_rag_chain(self):
-        # Query rewrite template remains the same
         query_rewrite_template = """You are a helpful assistant that rewrites queries to make them clearer and more specific.
 Given the query below, rewrite it to be more detailed and search-friendly. Do not ask for clarification - just improve the query.
 
@@ -190,6 +190,7 @@ Topic: {rewritten_query}
         prompt_multi_query = ChatPromptTemplate.from_template(multi_query_generation_template)
     
         def parse_queries(raw_output: str) -> List[str]:
+            #claude wooo
             # Split by newlines and clean up
             lines = [line.strip() for line in raw_output.split('\n')]
             # Filter out empty lines and numbered prefixes
@@ -197,8 +198,7 @@ Topic: {rewritten_query}
                 line.strip().lstrip('1234567890. ') 
                 for line in lines 
                 if line.strip() and not line.lower().startswith(('topic:', 'queries:', 'sure', 'please'))
-            ]
-            # Ensure we have valid queries
+            ]#sometimes query is not being rewritten to ensure we have valid queries
             return [q for q in queries if len(q) > 10]  # Basic length validation
     
         multi_query_chain = (
@@ -210,7 +210,6 @@ Topic: {rewritten_query}
 
         def generate_queries(query_dict: dict) -> List[str]:
             try:
-                # Get rewritten query
                 rewritten_query = rewrite_query_chain.invoke(query_dict)
                 logger.info(f"Rewritten Query: {rewritten_query}")
             
@@ -223,18 +222,17 @@ Topic: {rewritten_query}
                     logger.warning("No valid queries generated, using original and rewritten queries")
                     return [query_dict["question"], rewritten_query]
             
-                # Add original rewritten query to ensure it's included
                 queries = [rewritten_query] + raw_queries
-            
-                # Remove duplicates while preserving order
+                #unique queries because small models can generate duplicates
                 seen = set()
                 unique_queries = [q for q in queries if not (q in seen or seen.add(q))]
+
             
                 logger.info(f"Final Queries: {unique_queries}")
                 return unique_queries
             except Exception as e:
                 logger.error(f"Error in query generation: {str(e)}")
-                return [query_dict["question"]]  # Fallback to original question
+                return [query_dict["question"]]  
 
         def retrieve_all(queries: List[str]) -> List[List[Document]]:
             all_results = []
@@ -261,7 +259,6 @@ Topic: {rewritten_query}
             logger.info(f"Total fused documents: {len(fused_docs)}")
             return fused_docs
 
-        # Final answer template remains largely the same but with improved formatting
         final_template = """You are an expert assistant tasked with providing detailed, accurate, and well-structured answers based on the given context. If you don't find relevant information in the context, say "I don't have enough information to answer this question accurately."
 
 Context:
@@ -279,7 +276,7 @@ Instructions:
 Answer:"""
 
         prompt_final = ChatPromptTemplate.from_template(final_template)
-
+            #langchain cookbook
         context_chain = (
             RunnablePassthrough(fuse_results) 
             | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
