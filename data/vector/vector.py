@@ -27,11 +27,6 @@ logger = logging.getLogger(__name__)
 
 
 def parse_rewritten_query(raw_output: str) -> str:
-    """
-    Parses the rewritten query from the JSON output.
-    If the output is JSON with a "query" key, extract its value.
-    Otherwise, return the raw output.
-    """
     logger.info(f"Raw rewritten query output: {raw_output}")
     try:
         data = json.loads(raw_output)
@@ -44,41 +39,19 @@ def parse_rewritten_query(raw_output: str) -> str:
 
 def parse_queries(raw_output: str) -> List[str]:
     """
-    Parses the multi-query generation output.
-    If the output is JSON (list or dict), extract the queries.
-    This version also handles a JSON object with a 'queries' key.
-    Otherwise, split by newline and filter out any numbering.
+    Attempt to parse output as JSON.
+    Expect a JSON object with key "queries" mapping to an array of exactly 4 query strings.
+    Fallback: split by newlines.
     """
     logger.info(f"Raw multi-query output: {raw_output}")
     try:
         data = json.loads(raw_output)
-        if isinstance(data, list):
-            # If it's a list, process each item.
-            queries = []
-            for item in data:
-                if isinstance(item, dict) and "query" in item:
-                    queries.append(item["query"])
-                elif isinstance(item, str):
-                    queries.append(item)
+        if isinstance(data, dict) and "queries" in data and isinstance(data["queries"], list):
+            queries = [str(item) for item in data["queries"] if isinstance(item, str)]
             return queries
-        elif isinstance(data, dict):
-            # Check for "query" key
-            if "query" in data and isinstance(data["query"], str):
-                return [data["query"]]
-            # Check for "queries" key
-            if "queries" in data and isinstance(data["queries"], list):
-                queries = []
-                for item in data["queries"]:
-                    if isinstance(item, str):
-                        queries.append(item)
-                    elif isinstance(item, dict) and "query" in item:
-                        queries.append(item["query"])
-                return queries
     except json.JSONDecodeError:
-        # Fallback to plain text parsing.
         lines = [line.strip() for line in raw_output.split('\n') if line.strip()]
-        queries = [line.lstrip("1234567890. ").strip() for line in lines]
-        return [q for q in queries if len(q) > 10]
+        return lines
     return []
 
 
@@ -89,7 +62,6 @@ class RAGS:
         embedding_model: str = "BAAI/bge-m3",
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
-        # Lowered relevance threshold to 0.6
         relevance_threshold: float = 0.6,
         tavily_api_key: str = None
     ):
@@ -99,7 +71,6 @@ class RAGS:
         self.dimension = dimension
         self.relevance_threshold = relevance_threshold
 
-        # Set USER_AGENT environment variable
         os.environ["USER_AGENT"] = "MyRAGS/1.0 (violaze25@gmail.com)"
 
         self.setup_pinecone()
@@ -112,19 +83,17 @@ class RAGS:
         if tavily_api_key:
             os.environ["TAVILY_API_KEY"] = tavily_api_key
         self.web_search = TavilySearchResults(k=3)
-        # Instantiate ChatOllama with JSON output and low temperature for deterministic outputs.
-        self.llm = ChatOllama(model=self.llm_model, format="json", temperature=0.2)
+        # Increase max_tokens for longer outputs
+        self.llm = ChatOllama(model=self.llm_model, format="json", temperature=0.2, max_tokens=1024)
         self.setup_rag_chain()
         self.setup_crag_chains()
 
     def setup_pinecone(self):
         if not os.getenv("PINECONE_API_KEY"):
             os.environ["PINECONE_API_KEY"] = getpass.getpass("Enter your Pinecone API key: ")
-
         try:
             self.pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
             existing_indexes = [index_info["name"] for index_info in self.pc.list_indexes()]
-
             if self.index_name not in existing_indexes:
                 logger.info(f"Creating new Pinecone index: {self.index_name}")
                 self.pc.create_index(
@@ -136,7 +105,6 @@ class RAGS:
                 while not self.pc.describe_index(self.index_name).status["ready"]:
                     time.sleep(1)
                     logger.info("Waiting for index to be ready...")
-
             self.index = self.pc.Index(self.index_name)
         except Exception as e:
             raise Exception(f"Failed to initialize Pinecone: {str(e)}")
@@ -145,34 +113,21 @@ class RAGS:
         try:
             loader = WebBaseLoader(
                 web_paths=urls,
-                bs_kwargs=dict(
-                    parse_only=bs4.SoupStrainer(
-                        class_=("post-content", "post-title", "post-header")
-                    )
-                ),
+                bs_kwargs=dict(parse_only=bs4.SoupStrainer(class_=("post-content", "post-title", "post-header")))
             )
             docs = loader.load()
-
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200
-            )
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             splits = text_splitter.split_documents(docs)
-
             logger.info(f"Adding {len(splits)} document chunks to Pinecone vector store.")
             self.vector_store.add_documents(splits)
-
             self.bm25_corpus = [doc.page_content for doc in splits]
-            # Increase BM25 retrieval top_k from 5 to 10
             self.bm25 = BM25Okapi([doc.split() for doc in self.bm25_corpus])
-
             logger.info("BM25 corpus and index built.")
             return splits
         except Exception as e:
             raise Exception(f"Failed to load web content: {str(e)}")
 
     def setup_crag_chains(self):
-        """Setup CRAG-specific chains for document evaluation and refinement."""
         relevance_template = (
             "You are an expert document evaluator. For the given question and document, output only a valid JSON object "
             "with a single key \"score\". The score must be a floating point number between 0 and 1, where 0 means "
@@ -182,11 +137,7 @@ class RAGS:
             "Output:"
         )
         self.relevance_prompt = ChatPromptTemplate.from_template(relevance_template)
-        self.relevance_chain = (
-            self.relevance_prompt
-            | self.llm
-            | JsonOutputParser()
-        )
+        self.relevance_chain = self.relevance_prompt | self.llm | JsonOutputParser()
 
         strip_template = (
             "Break this document into distinct knowledge units (strips) that relate to answering the question. "
@@ -196,11 +147,7 @@ class RAGS:
             "Format each knowledge strip as a separate bullet point."
         )
         self.strip_prompt = ChatPromptTemplate.from_template(strip_template)
-        self.strip_chain = (
-            self.strip_prompt
-            | self.llm
-            | StrOutputParser()
-        )
+        self.strip_chain = self.strip_prompt | self.llm | StrOutputParser()
 
         strip_relevance_template = (
             "Evaluate the relevance of the following knowledge strip to the question. Output only a valid JSON object "
@@ -211,14 +158,9 @@ class RAGS:
             "Output:"
         )
         self.strip_relevance_prompt = ChatPromptTemplate.from_template(strip_relevance_template)
-        self.strip_relevance_chain = (
-            self.strip_relevance_prompt
-            | self.llm
-            | JsonOutputParser()
-        )
+        self.strip_relevance_chain = self.strip_relevance_prompt | self.llm | JsonOutputParser()
 
     def setup_rag_chain(self):
-        """Setup the RAG chain including query rewriting and multi-query generation."""
         query_rewrite_template = (
             "You are a helpful assistant that rewrites queries to be clearer and more detailed. "
             "Rewrite the following query in a concise and detailed manner. For example, if given 'weather', output "
@@ -237,9 +179,10 @@ class RAGS:
 
         rewrite_query_chain = rewrite_query_with_logging
 
+        # Updated multi-query prompt: force JSON output with exactly 4 queries.
         multi_query_generation_template = (
-            "Generate exactly 4 different search queries related to the topic below. Each query should explore a "
-            "different aspect. Output the result as a JSON array of strings.\n\n"
+            "Generate exactly 4 distinct search queries related to the topic below. Each query should cover a different aspect of the topic. "
+            "Output a JSON object with a key \"queries\" mapping to an array of exactly 4 query strings. Do not include any additional keys.\n\n"
             "Topic: {rewritten_query}\n\n"
             "Output:"
         )
@@ -249,18 +192,15 @@ class RAGS:
             try:
                 rewritten_query = rewrite_query_chain(input_dict)
                 logger.info(f"Rewritten Query for multi-query generation: {rewritten_query}")
-
                 raw_queries = (prompt_multi_query | self.llm | StrOutputParser()).invoke({"rewritten_query": rewritten_query})
                 queries = parse_queries(raw_queries)
                 logger.info(f"Raw Generated Queries: {queries}")
-
-                if not queries or len(queries) < 4:
-                    logger.warning("Did not get 4 queries; falling back to original and rewritten query.")
+                if len(queries) != 4:
+                    logger.warning("Did not get exactly 4 queries; falling back to using the original and rewritten query.")
                     return [input_dict["question"], rewritten_query]
-
-                queries = [rewritten_query] + queries
+                final_queries = [rewritten_query] + queries
                 seen = set()
-                unique_queries = [q for q in queries if not (q in seen or seen.add(q))]
+                unique_queries = [q for q in final_queries if not (q in seen or seen.add(q))]
                 logger.info(f"Final Queries: {unique_queries}")
                 return unique_queries
             except Exception as e:
@@ -269,31 +209,20 @@ class RAGS:
 
         self.generate_queries = generate_queries
 
-        # Enhanced final prompt instructing a detailed and comprehensive answer with examples.
         final_template = (
-            "You are an expert assistant. Using the context provided, compose a comprehensive, detailed, and well-structured answer "
-            "in plain text. Your answer should include examples, explanations, and, if applicable, real-world applications. "
+            "You are an expert assistant. Using the context provided, compose a comprehensive, detailed, and well-structured answer in plain text. "
+            "Your answer should be at least 500 words long and include examples, benefits, potential pitfalls, and real-world applications of task decomposition. "
             "If the context is insufficient, say \"I don't have enough information to answer this question accurately.\" \n\n"
             "Context:\n{context}\n\n"
             "Question: {question}\n\n"
             "Answer (please be as detailed as possible):"
         )
         prompt_final = ChatPromptTemplate.from_template(final_template)
-
-        context_chain = (
-            RunnablePassthrough(lambda queries: self.format_docs(queries))
-            | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
-        )
-
-        self.final_rag_chain = (
-            {
+        context_chain = RunnablePassthrough(lambda queries: self.format_docs(queries)) | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
+        self.final_rag_chain = ({
                 "context": context_chain,
                 "question": itemgetter("question"),
-            }
-            | prompt_final
-            | self.llm
-            | StrOutputParser()
-        )
+            } | prompt_final | self.llm | StrOutputParser())
 
     def format_docs(self, docs: List[Union[Document, str]]) -> str:
         formatted_docs = []
@@ -321,12 +250,8 @@ class RAGS:
         try:
             results = self.web_search.invoke(query)
             documents = [
-                Document(
-                    page_content=result.get("content", ""),
-                    metadata={"source": "web", "url": result.get("url", "")}
-                )
-                for result in results
-                if isinstance(result, dict)
+                Document(page_content=result.get("content", ""), metadata={"source": "web", "url": result.get("url", "")})
+                for result in results if isinstance(result, dict)
             ]
             logger.info(f"Web search found {len(documents)} documents for query: {query}")
             return documents
@@ -337,7 +262,6 @@ class RAGS:
     def reciprocal_rank_fusion(self, results: List[List[Union[Document, str]]], k: int = 60) -> List[Document]:
         fused_scores = {}
         doc_map = {}
-
         for result_list in results:
             for rank, doc in enumerate(result_list):
                 if not isinstance(doc, (Document, str)):
@@ -388,11 +312,7 @@ class RAGS:
                 "document": document.page_content
             })
             logger.info(f"Raw knowledge strips response: {raw_response}")
-            strips = [
-                strip.strip().lstrip('•-* ')
-                for strip in raw_response.split('\n')
-                if strip.strip() and not strip.isspace()
-            ]
+            strips = [strip.strip().lstrip('•-* ') for strip in raw_response.split('\n') if strip.strip() and not strip.isspace()]
             return strips
         except Exception as e:
             logger.error(f"Error creating knowledge strips: {e}")
@@ -411,63 +331,44 @@ class RAGS:
             return 0.0
 
     def process_with_crag(self, question: str, documents: List[Document]) -> List[Document]:
-        """Process documents using the CRAG methodology"""
         logger.info("Starting CRAG document processing")
-
         processed_docs = []
         need_web_search = True
-
         for doc in documents:
             relevance_score = self.evaluate_document_relevance(question, doc)
             logger.info(f"Document relevance score: {relevance_score}")
-
             if relevance_score >= self.relevance_threshold:
                 need_web_search = False
                 strips = self.create_knowledge_strips(question, doc)
                 relevant_strips = []
-
                 for strip in strips:
                     strip_score = self.evaluate_strip_relevance(question, strip)
                     logger.info(f"Knowledge strip relevance score: {strip_score} for strip: {strip}")
                     if strip_score >= self.relevance_threshold:
                         relevant_strips.append(strip)
-
                 if relevant_strips:
                     processed_docs.append(Document(
                         page_content="\n".join(relevant_strips),
-                        metadata={
-                            **doc.metadata,
-                            "relevance_score": relevance_score,
-                            "processed_by_crag": True
-                        }
+                        metadata={**doc.metadata, "relevance_score": relevance_score, "processed_by_crag": True}
                     ))
             elif relevance_score == -1:
                 need_web_search = True
-
         if need_web_search:
             logger.info("No highly relevant documents found or uncertain relevance, performing web search")
             web_docs = self.web_search_documents(question)
-
             for doc in web_docs:
                 strips = self.create_knowledge_strips(question, doc)
                 relevant_strips = []
-
                 for strip in strips:
                     strip_score = self.evaluate_strip_relevance(question, strip)
                     logger.info(f"Web knowledge strip relevance score: {strip_score} for strip: {strip}")
                     if strip_score >= self.relevance_threshold:
                         relevant_strips.append(strip)
-
                 if relevant_strips:
                     processed_docs.append(Document(
                         page_content="\n".join(relevant_strips),
-                        metadata={
-                            **doc.metadata,
-                            "source": "web_search",
-                            "processed_by_crag": True
-                        }
+                        metadata={**doc.metadata, "source": "web_search", "processed_by_crag": True}
                     ))
-
         logger.info(f"CRAG processing complete. Found {len(processed_docs)} relevant documents")
         return processed_docs
 
@@ -485,9 +386,11 @@ class RAGS:
             if not relevant_docs:
                 logger.warning("No relevant documents found after CRAG processing")
                 return "I couldn't find any relevant information to answer your question accurately."
+            # Sort by relevance score stored in metadata and only take top 3 documents.
+            sorted_docs = sorted(relevant_docs, key=lambda d: d.metadata.get("relevance_score", 0), reverse=True)[:3]
             answer = self.final_rag_chain.invoke({
                 "question": question,
-                "context": self.format_docs(relevant_docs)
+                "context": self.format_docs(sorted_docs)
             })
             logger.info("Generated answer using enhanced retrieval and CRAG")
             return answer
@@ -497,19 +400,14 @@ class RAGS:
 
 
 def main():
-    # Replace the tavily_api_key with your actual key.
     rag_system = RAGS(tavily_api_key="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")
-    urls = [
-        "https://lilianweng.github.io/posts/2023-06-23-agent//",
-    ]
+    urls = ["https://lilianweng.github.io/posts/2023-06-23-agent//"]
     try:
         documents = rag_system.load_web_content(urls)
         logger.info(f"Loaded {len(documents)} document chunks from the provided URLs.")
     except Exception as e:
         logger.error(f"Error loading web content: {e}")
         documents = []
-
-    # Example query:
     question = "explain about task decomposition?"
     try:
         answer = rag_system.query(question)
