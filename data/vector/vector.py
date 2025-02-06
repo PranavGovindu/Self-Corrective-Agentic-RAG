@@ -32,6 +32,9 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Set the USER_AGENT environment variable
+os.environ["USER_AGENT"] = "MyRAGS/1.0 (your_email@example.com)"
+
 
 def parse_rewritten_query(raw_output: str) -> str:
     logger.info(f"Raw rewritten query output: {raw_output}")
@@ -186,7 +189,7 @@ class RAGS:
         embedding_model: str = "BAAI/bge-m3",
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
-        relevance_threshold: float = 0.5,  # lowered threshold
+        relevance_threshold: float = 0.5,  # You might lower this threshold if needed
         tavily_api_key: str = None
     ):
         self.index_name = index_name
@@ -195,8 +198,6 @@ class RAGS:
         self.dimension = dimension
         self.relevance_threshold = relevance_threshold
         self.document_loader = DocumentProcessor()
-
-        os.environ["USER_AGENT"] = "MyRAGS/1.0 (violaze25@gmail.com)"
 
         self.setup_pinecone()
         self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
@@ -238,85 +239,57 @@ class RAGS:
         return self.load_content(urls)
     
     def load_content(self, sources: List[str]):
-        """
-        Load content from different sources.
-        sources: list of file paths or URLs.
-        Will stop execution if any document fails to process.
-        """
+        """Load and process content from various sources"""
         all_documents = []
-        
-        # First, validate all sources exist
-        for source in sources:
-            if not source.startswith(('http://', 'https://')):
-                if not os.path.exists(source):
-                    raise DocumentProcessingError(f"File does not exist: {source}")
-        
+
         for source in sources:
             try:
-                # Check if the source is a URL
-                if source.startswith(('http://', 'https://')):
-                    docs = self.document_loader.load_url(source)
-                else:
-                    # Get the file extension
-                    file_extension = os.path.splitext(source)[1].lower()
-                    
-                    # Load based on file type
-                    if file_extension == '.pdf':
-                        docs = self.document_loader.load_pdf(source)
-                    elif file_extension == '.docx':
-                        docs = self.document_loader.load_docx(source)
-                    elif file_extension == '.csv':
-                        docs = self.document_loader.load_csv(source)
-                    else:
-                        raise DocumentProcessingError(f"Unsupported file type: {file_extension}")
-                
-                # Split documents into smaller chunks
+                logger.info(f"Starting to process source: {source}")
+                docs = self.document_loader.load_document(source)
+                logger.info(f"Loaded {len(docs)} raw documents from {source}")
+
                 text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200
+                    chunk_size=2000,
+                    chunk_overlap=300
                 )
                 splits = text_splitter.split_documents(docs)
+                logger.info(f"Created {len(splits)} splits from {source}")
+
+                splits = [split for split in splits if split.page_content.strip()]
+                logger.info(f"Have {len(splits)} non-empty splits")
+
+                try:
+                    ids = self.vector_store.add_documents(splits)
+                    logger.info(f"Added {len(ids)} documents to vector store")
+                except Exception as e:
+                    logger.error(f"Error adding to vector store: {e}")
+                    raise
                 
-                if not splits:
-                    raise DocumentProcessingError(f"No content after splitting document: {source}")
-                
-                # Add to vector store
-                self.vector_store.add_documents(splits)
-                
-                # Update BM25
-                new_texts = [doc.page_content for doc in splits]
-                self.bm25_corpus.extend(new_texts)
-                
-                # Update BM25 index
-                self.bm25 = BM25Okapi([doc.split() for doc in self.bm25_corpus])
-                
+                texts = [doc.page_content for doc in splits]
+                self.bm25_corpus.extend(texts)
+                self.bm25 = BM25Okapi([text.split() for text in self.bm25_corpus])
+                logger.info(f"Updated BM25 index with {len(texts)} new documents")
+
                 all_documents.extend(splits)
-                logger.info(f"Successfully processed {source}")
-                
+
             except Exception as e:
-                # Log the error and exit the program
-                logger.error(f"Critical error processing {source}: {str(e)}")
-                sys.exit(1)  # Exit with error code 1
-        
-        logger.info(f"Successfully loaded all {len(all_documents)} documents")
+                logger.error(f"Error processing {source}: {e}")
+                raise
+
+        if not all_documents:
+            raise ValueError("No documents were successfully processed")
+
         return all_documents
 
     def setup_crag_chains(self):
-        relevance_template = ("""
-           Assume you are a human expert in grading predictions given by a model. You are given a question and a model prediction. Judge if the prediction matches the ground truth answer by following these steps:
-        1: Take it as granted that the Ground Truth is always correct.
-        2: If the Prediction indicates it is not sure about the answer, "score" should be "0"; otherwise, go the next step.
-        3: If the Prediction exactly matches the Ground Truth, "score" is 1.
-        4: If the Prediction does not exactly match the Ground Truth, go through the following steps and likely give a score as 0.
-        5: If the Ground Truth is a number, "score" is 1 if and only if the Prediction gives a number that almost exactly matches the ground truth.
-        6: If the Prediction is self-contradictory, "score" must be 0.
-        7: If the prediction is not answering the question, "score" must be 0.
-        8: If the prediction is a concise and correct summary of the ground truth, "score" is 1.
-        9: If ground truth contains a set of items, prediction must contain exactly same items for the score to be 1.
-        10: Otherwise, "score" is 0.
-
-        ### Output a JSON blob with an "explanation" field explaining your answer as short as possible and an "score" field with value 1 or 0.
-     """   )
+        # Updated relevance prompt for CRAG: simpler instructions to judge document relevance
+        relevance_template = (
+            "Evaluate the relevance of the provided document to the question. "
+            "If the document contains sufficient information that directly addresses the question, output a JSON object with 'score' set to 1; otherwise, set 'score' to 0.\n\n"
+            "Question: {question}\n"
+            "Document: {document}\n\n"
+            "Output:"
+        )
         self.relevance_prompt = ChatPromptTemplate.from_template(relevance_template)
         self.relevance_chain = self.relevance_prompt | self.llm | JsonOutputParser()
 
@@ -390,23 +363,22 @@ class RAGS:
         self.generate_queries = generate_queries
 
         final_template = """ 
-        
-        You are a highly intelligent and precise AI assistant. Answer the given question using only the provided context.  
+You are a highly intelligent AI assistant specialized in analyzing and explaining concepts.
+Provide a clear and detailed response using only the provided context.
 
-    ### Context:  
-    {context}  
-    
-    ### Question:  
-    {question}  
-    
-    ### Instructions:  
-    - Use only the information from the context. Do not use prior knowledge.  
-    - If the answer is in the context, provide a clear and well-structured response.  
-    - If the context does not contain the answer, say: "The context does not provide sufficient information."  
-    - Keep the response concise and to the point while maintaining completeness.  
+### Context:  
+{context}  
 
-         """
+### Question:  
+{question}  
 
+### Instructions:  
+- Focus on explaining the key concepts and their relationships
+- Use clear, natural language (do not output JSON or other structured formats)
+- If the context contains only partial information, explain what aspects are covered
+- If the context doesn't provide enough information, say so directly
+- Keep the response well-structured but conversational
+"""
 
         prompt_final = ChatPromptTemplate.from_template(final_template)
         context_chain = RunnablePassthrough(lambda queries: self.format_docs(queries)) | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
@@ -492,22 +464,55 @@ class RAGS:
         return [doc_map[key] for key, _ in sorted_res]
 
     def hybrid_retrieve_for_query(self, query: str, top_k=4) -> List[Document]:
-        logger.info(f"Hybrid retrieval for query: '{query}'")
-        pinecone_results = self.retriever.invoke(query, k=top_k)
-        logger.info(f"Pinecone retrieved {len(pinecone_results)} documents for query: '{query}'")
-        pinecone_results = [
-            Document(page_content=result.page_content) if isinstance(result, Document)
-            else Document(page_content=result) if isinstance(result, str)
-            else result
-            for result in pinecone_results
-        ]
-        bm25_results = self.bm25_retrieve(query, top_k=top_k)
-        logger.info(f"BM25 retrieved {len(bm25_results)} documents for query: '{query}'")
-        
+        """hybrid retrieval for a query"""
+        logger.info(f"Starting hybrid retrieval for query: '{query}'")
+
+        try:
+            try:
+                stats = self.vector_store.describe_index_stats()
+                logger.info(f"Vector store stats: {stats}")
+                if stats.get('total_vector_count', 0) == 0:
+                    logger.error("Vector store is empty!")
+                    return []
+            except AttributeError:
+                logger.warning("describe_index_stats not available on the vector store; proceeding without stats check.")
+            except Exception as e:
+                logger.error(f"Error checking vector store: {e}")
+        except Exception as e:
+            logger.error(f"Error in vector store verification: {e}")
+
+        try:
+            pinecone_results = self.retriever.invoke(query, k=top_k)
+            logger.info(f"Pinecone retrieved {len(pinecone_results)} documents")
+            logger.info(f"Sample Pinecone result: {pinecone_results[0].page_content[:200] if pinecone_results else 'None'}")
+        except Exception as e:
+            logger.error(f"Pinecone retrieval error: {e}")
+            pinecone_results = []
+
+        try:
+            bm25_results = self.bm25_retrieve(query, top_k=top_k)
+            logger.info(f"BM25 retrieved {len(bm25_results)} documents")
+            logger.info(f"Sample BM25 result: {bm25_results[0].page_content[:200] if bm25_results else 'None'}")
+        except Exception as e:
+            logger.error(f"BM25 retrieval error: {e}")
+            bm25_results = []
+
+        if not pinecone_results and not bm25_results:
+            logger.error("No results from either retriever!")
+            return []
+
         combined_results = self.combine_scores(pinecone_results, bm25_results)
         fused = self.reciprocal_rank_fusion([combined_results])[:top_k]
-        logger.info(f"Fused result contains {len(fused)} documents for query: '{query}'")
+
+        if not fused:
+            logger.error("No results after fusion!")
+            return []
+
+        logger.info(f"Final fused results: {len(fused)} documents")
+        logger.info(f"Sample fused result: {fused[0].page_content[:200] if fused else 'None'}")
+
         return fused
+
 
     def evaluate_document_relevance(self, question: str, document: Document) -> float:
         try:
@@ -528,10 +533,8 @@ class RAGS:
                 "document": document.page_content
             })
             logger.info(f"Raw knowledge strips response: {raw_response}")
-            # Expect each bullet to start with a dash (-)
             lines = raw_response.split('\n')
             strips = [line.strip().lstrip('-').strip() for line in lines if line.strip() and line.startswith('-')]
-            # Fallback: if no dash found, split on newline
             if not strips:
                 strips = [line.strip() for line in lines if line.strip()]
             return strips
@@ -556,7 +559,6 @@ class RAGS:
         processed_docs = []
         need_web_search = True
 
-        # Process the retrieved documents using CRAG
         for doc in documents[:4]:
             relevance_score = self.evaluate_document_relevance(question, doc)
             logger.info(f"Document relevance score: {relevance_score}")
@@ -577,7 +579,6 @@ class RAGS:
             elif relevance_score == -1:
                 need_web_search = True
 
-        # If the flag indicates we need web search, or if no processed docs are available, then perform web search
         if need_web_search or not processed_docs:
             logger.info("CRAG processing did not yield sufficient results; performing web search fallback.")
             web_docs = self.web_search_documents(question)[:3]
@@ -595,7 +596,6 @@ class RAGS:
                         metadata={**doc.metadata, "source": "web_search", "processed_by_crag": True}
                     ))
 
-        # Final fallback: if still no processed documents, use the top retrieved documents.
         if not processed_docs:
             logger.warning("CRAG processing and web search fallback produced no processed documents; falling back to top retrieved documents.")
             processed_docs = documents[:3]
@@ -604,37 +604,50 @@ class RAGS:
 
 
     def query(self, question: str) -> str:
+        """Final query answering"""
         try:
             logger.info(f"Processing question: {question}")
             queries = self.generate_queries({"question": question})[:3]
+            if not queries:
+                raise ValueError("No queries generated")
             logger.info(f"Generated queries: {queries}")
-            
+
             all_retrieved_docs = []
-
             for query in queries:
-                retrieved_docs = self.hybrid_retrieve_for_query(query, top_k=3)
-                all_retrieved_docs.extend(retrieved_docs)
-           
-            reranked_docs = self.reciprocal_rank_fusion([all_retrieved_docs])[:5]
-           
-            relevant_docs = self.process_with_crag(question, reranked_docs)
-            if not relevant_docs:
-                logger.warning("No relevant documents found after CRAG processing")
-                return "I couldn't find any relevant information to answer your question accurately."
+                docs = self.hybrid_retrieve_for_query(query, top_k=3)
+                if docs:
+                    all_retrieved_docs.extend(docs)
 
-            sorted_docs = sorted(relevant_docs, key=lambda d: d.metadata.get("relevance_score", 0), reverse=True)[:3]
-           
-            answer = self.final_rag_chain.invoke({
+            if not all_retrieved_docs:
+                return "No relevant information found in the indexed documents."
+
+            relevant_docs = self.process_with_crag(question, all_retrieved_docs)
+            if not relevant_docs:
+                return "Could not find relevant information after CRAG processing."
+
+            raw_answer = self.final_rag_chain.invoke({
                 "question": question,
-                "context": self.format_docs(sorted_docs)
+                "context": self.format_docs(relevant_docs)
             })
-          
-            logger.info("Generated answer using enhanced retrieval and CRAG")
-          
-            return answer
+        
+            if raw_answer.strip().startswith('{'):
+                try:
+                    answer_json = json.loads(raw_answer)
+                    if isinstance(answer_json, dict):
+                        if 'context' in answer_json:
+                            return answer_json['context']
+                        for key in ['answer', 'response', 'content', 'text']:
+                            if key in answer_json:
+                                return answer_json[key]
+                except json.JSONDecodeError:
+                    pass
+                    
+            return raw_answer.strip()
+            
+
         except Exception as e:
             logger.error(f"Error in query processing: {str(e)}")
-            raise Exception(f"Failed to process query: {str(e)}")
+            return f"An error occurred while processing your query: {str(e)}"
 
 
 def main():
@@ -646,7 +659,7 @@ def main():
     except Exception as e:
         logger.error(f"Error loading content: {e}")
         documents = []
-    question = "give a summary about the paper?"
+    question = "explain about this paper?"
     try:
         answer = rag_system.query(question)
         print("Final Answer:")
