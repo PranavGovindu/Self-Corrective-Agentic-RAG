@@ -2,14 +2,21 @@ import os
 import getpass
 import time
 import logging
-from typing import List, Union
+from typing import List, Union, Dict
 from operator import itemgetter
 import hashlib
-import json  # For JSON parsing
-
+import json
+import sys
+import chardet
 import bs4
-from langchain import hub
-from langchain_community.document_loaders import WebBaseLoader
+
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    UnstructuredWordDocumentLoader,
+    CSVLoader,
+    WebBaseLoader
+)
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -53,6 +60,122 @@ def parse_queries(raw_output: str) -> List[str]:
         lines = [line.strip() for line in raw_output.split('\n') if line.strip()]
         return lines
     return []
+class DocumentProcessingError(Exception):
+    """Custom exception for document processing errors"""
+    pass
+
+
+
+class DocumentProcessor:
+    """Handles loading and processing of various document formats"""
+    
+    def __init__(self):
+        self.supported_extensions = {
+            '.pdf': self.load_pdf,
+            '.docx': self.load_docx,
+            '.doc': self.load_docx,
+            '.csv': self.load_csv,
+            '.txt': self.load_text,
+            'url': self.load_url
+        }
+
+    def load_pdf(self, file_path: str) -> List[Document]:
+        """Load and process PDF documents"""
+        try:
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+            for doc in documents:
+                doc.metadata['source_type'] = 'pdf'
+                doc.metadata['file_path'] = file_path
+            return documents
+        except Exception as e:
+            raise Exception(f"Error loading PDF {file_path}: {str(e)}")
+
+    def load_docx(self, file_path: str) -> List[Document]:
+        """Load and process DOCX/DOC documents"""
+        try:
+            try:
+                loader = Docx2txtLoader(file_path)
+                documents = loader.load()
+            except:
+                loader = UnstructuredWordDocumentLoader(file_path)
+                documents = loader.load()
+            
+            for doc in documents:
+                doc.metadata['source_type'] = 'docx'
+                doc.metadata['file_path'] = file_path
+            return documents
+        except Exception as e:
+            raise Exception(f"Error loading DOCX {file_path}: {str(e)}")
+
+    def load_csv(self, file_path: str) -> List[Document]:
+        """Load a CSV file"""
+        logger.info(f"Loading CSV: {file_path}")
+        try:
+            loader = CSVLoader(file_path)
+            docs = loader.load()
+            if not docs:
+                raise DocumentProcessingError(f"No content extracted from CSV: {file_path}")
+            logger.info(f"Successfully loaded CSV with {len(docs)} rows")
+            return docs
+        except Exception as e:
+            raise DocumentProcessingError(f"Failed to process CSV {file_path}: {str(e)}")
+
+    def load_text(self, file_path: str) -> List[Document]:
+        """Load and process text files with encoding detection"""
+        try:
+            with open(file_path, 'rb') as file:
+                raw_data = file.read()
+                result = chardet.detect(raw_data)
+                encoding = result['encoding']
+
+            with open(file_path, 'r', encoding=encoding) as file:
+                text = file.read()
+
+            document = Document(
+                page_content=text,
+                metadata={
+                    'source_type': 'text',
+                    'file_path': file_path
+                }
+            )
+            return [document]
+        except Exception as e:
+            raise Exception(f"Error loading text file {file_path}: {str(e)}")
+
+    def load_url(self, url: str) -> List[Document]:
+        """Load content from URLs"""
+        try:
+            loader = WebBaseLoader(
+                web_paths=[url],
+                bs_kwargs=dict(parse_only=bs4.SoupStrainer(class_=("post-content", "post-title", "post-header")))
+            )
+            documents = loader.load()
+            for doc in documents:
+                doc.metadata['source_type'] = 'url'
+                doc.metadata['url'] = url
+            return documents
+        except Exception as e:
+            raise Exception(f"Error loading URL {url}: {str(e)}")
+
+    def load_document(self, source: str) -> List[Document]:
+        """
+        Load a document from a file path or URL
+        Args:
+            source: Path to file or URL
+        Returns:
+            List of Document objects
+        """
+        if source.startswith(('http://', 'https://')):
+            return self.supported_extensions['url'](source)
+        
+        _, extension = os.path.splitext(source)
+        extension = extension.lower()
+        
+        if extension not in self.supported_extensions:
+            raise ValueError(f"Unsupported file format: {extension}")
+            
+        return self.supported_extensions[extension](source)
 
 
 class RAGS:
@@ -70,6 +193,7 @@ class RAGS:
         self.llm_model = llm_model
         self.dimension = dimension
         self.relevance_threshold = relevance_threshold
+        self.document_loader = DocumentProcessor()
 
         os.environ["USER_AGENT"] = "MyRAGS/1.0 (violaze25@gmail.com)"
 
@@ -109,23 +233,72 @@ class RAGS:
         except Exception as e:
             raise Exception(f"Failed to initialize Pinecone: {str(e)}")
 
-    def load_web_content(self, urls: List[str]) -> List[Document]:
-        try:
-            loader = WebBaseLoader(
-                web_paths=urls,
-                bs_kwargs=dict(parse_only=bs4.SoupStrainer(class_=("post-content", "post-title", "post-header")))
-            )
-            docs = loader.load()
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            splits = text_splitter.split_documents(docs)
-            logger.info(f"Adding {len(splits)} document chunks to Pinecone vector store.")
-            self.vector_store.add_documents(splits)
-            self.bm25_corpus = [doc.page_content for doc in splits]
-            self.bm25 = BM25Okapi([doc.split() for doc in self.bm25_corpus])
-            logger.info("BM25 corpus and index built.")
-            return splits
-        except Exception as e:
-            raise Exception(f"Failed to load web content: {str(e)}")
+    def load_web_content(self, urls):
+        return self.load_content(urls)
+    
+    def load_content(self, sources: List[str]):
+        """
+        Load content from different sources
+        sources: list of file paths or URLs
+        Will stop execution if any document fails to process
+        """
+        all_documents = []
+        
+        # First, validate all sources exist
+        for source in sources:
+            if not source.startswith(('http://', 'https://')):
+                if not os.path.exists(source):
+                    raise DocumentProcessingError(f"File does not exist: {source}")
+        
+        for source in sources:
+            try:
+                # Check if the source is a URL
+                if source.startswith(('http://', 'https://')):
+                    docs = self.document_loader.load_url(source)
+                else:
+                    # Get the file extension
+                    file_extension = os.path.splitext(source)[1].lower()
+                    
+                    # Load based on file type
+                    if file_extension == '.pdf':
+                        docs = self.document_loader.load_pdf(source)
+                    elif file_extension == '.docx':
+                        docs = self.document_loader.load_docx(source)
+                    elif file_extension == '.csv':
+                        docs = self.document_loader.load_csv(source)
+                    else:
+                        raise DocumentProcessingError(f"Unsupported file type: {file_extension}")
+                
+                # Split documents into smaller chunks
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200
+                )
+                splits = text_splitter.split_documents(docs)
+                
+                if not splits:
+                    raise DocumentProcessingError(f"No content after splitting document: {source}")
+                
+                # Add to vector store
+                self.vector_store.add_documents(splits)
+                
+                # Update BM25
+                new_texts = [doc.page_content for doc in splits]
+                self.bm25_corpus.extend(new_texts)
+                
+                # Update BM25 index
+                self.bm25 = BM25Okapi([doc.split() for doc in self.bm25_corpus])
+                
+                all_documents.extend(splits)
+                logger.info(f"Successfully processed {source}")
+                
+            except Exception as e:
+                # Log the error and exit the program
+                logger.error(f"Critical error processing {source}: {str(e)}")
+                sys.exit(1)  # Exit with error code 1
+        
+        logger.info(f"Successfully loaded all {len(all_documents)} documents")
+        return all_documents
 
     def setup_crag_chains(self):
         relevance_template = (
@@ -401,14 +574,14 @@ class RAGS:
 
 def main():
     rag_system = RAGS(tavily_api_key="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")
-    urls = ["https://lilianweng.github.io/posts/2023-06-23-agent//"]
+    sources = ["pasa.pdf"]
     try:
-        documents = rag_system.load_web_content(urls)
+        documents = rag_system.load_content(sources)
         logger.info(f"Loaded {len(documents)} document chunks from the provided URLs.")
     except Exception as e:
         logger.error(f"Error loading web content: {e}")
         documents = []
-    question = "explain about task decomposition?"
+    question = "give a summary about the paper?"
     try:
         answer = rag_system.query(question)
         print("Final Answer:")
