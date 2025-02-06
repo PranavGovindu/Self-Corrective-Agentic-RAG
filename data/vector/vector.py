@@ -7,6 +7,7 @@ from operator import itemgetter
 import hashlib
 import json
 import sys
+import re
 import chardet
 import bs4
 
@@ -31,9 +32,6 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Set the USER_AGENT environment variable
-os.environ["USER_AGENT"] = "MyRAGS/1.0 (your_email@example.com)"
 
 
 def parse_rewritten_query(raw_output: str) -> str:
@@ -76,44 +74,35 @@ class DocumentProcessor:
     def __init__(self):
         self.supported_extensions = {
             '.pdf': self.load_pdf,
-            '.docx': self.load_docx,
-            '.doc': self.load_docx,
             '.csv': self.load_csv,
             '.txt': self.load_text,
             'url': self.load_url
         }
 
     def load_pdf(self, file_path: str) -> List[Document]:
-        """Load and process PDF documents"""
+        """Post-process extracted text from PDF."""
         try:
             loader = PyPDFLoader(file_path)
-            documents = loader.load()
-            for doc in documents:
-                doc.metadata['source_type'] = 'pdf'
-                doc.metadata['file_path'] = file_path
-            return documents
+            docs = loader.load()
+            for doc in docs:
+                doc.page_content = self.clean_pdf_text(doc.page_content)
+                doc.metadata.update({
+                    'source_type': 'pdf',
+                    'file_path': file_path
+                })
+            return docs
         except Exception as e:
+            logger.error(f"PDF loading error: {str(e)}")
             raise Exception(f"Error loading PDF {file_path}: {str(e)}")
-
-    def load_docx(self, file_path: str) -> List[Document]:
-        """Load and process DOCX/DOC documents"""
-        try:
-            try:
-                loader = Docx2txtLoader(file_path)
-                documents = loader.load()
-            except Exception:
-                loader = UnstructuredWordDocumentLoader(file_path)
-                documents = loader.load()
-            
-            for doc in documents:
-                doc.metadata['source_type'] = 'docx'
-                doc.metadata['file_path'] = file_path
-            return documents
-        except Exception as e:
-            raise Exception(f"Error loading DOCX {file_path}: {str(e)}")
+        
+    def clean_pdf_text(self, text: str) -> str:
+        """Clean common PDF extraction artifacts."""
+        text = text.replace('\n', ' ')
+        text = ' '.join(text.split())
+        return text
 
     def load_csv(self, file_path: str) -> List[Document]:
-        """Load a CSV file"""
+        """Load a CSV file."""
         logger.info(f"Loading CSV: {file_path}")
         try:
             loader = CSVLoader(file_path)
@@ -126,16 +115,14 @@ class DocumentProcessor:
             raise DocumentProcessingError(f"Failed to process CSV {file_path}: {str(e)}")
 
     def load_text(self, file_path: str) -> List[Document]:
-        """Load and process text files with encoding detection"""
+        """Load and process text files with encoding detection."""
         try:
             with open(file_path, 'rb') as file:
                 raw_data = file.read()
                 result = chardet.detect(raw_data)
                 encoding = result['encoding']
-
             with open(file_path, 'r', encoding=encoding) as file:
                 text = file.read()
-
             document = Document(
                 page_content=text,
                 metadata={
@@ -148,7 +135,7 @@ class DocumentProcessor:
             raise Exception(f"Error loading text file {file_path}: {str(e)}")
 
     def load_url(self, url: str) -> List[Document]:
-        """Load content from URLs"""
+        """Load content from URLs."""
         try:
             loader = WebBaseLoader(
                 web_paths=[url],
@@ -164,11 +151,11 @@ class DocumentProcessor:
 
     def load_document(self, source: str) -> List[Document]:
         """
-        Load a document from a file path or URL
+        Load a document from a file path or URL.
         Args:
-            source: Path to file or URL
+            source: Path to file or URL.
         Returns:
-            List of Document objects
+            List of Document objects.
         """
         if source.startswith(('http://', 'https://')):
             return self.supported_extensions['url'](source)
@@ -189,7 +176,7 @@ class RAGS:
         embedding_model: str = "BAAI/bge-m3",
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
-        relevance_threshold: float = 0.5,  # You might lower this threshold if needed
+        relevance_threshold: float = 0.5,  # Adjust threshold as needed
         tavily_api_key: str = None
     ):
         self.index_name = index_name
@@ -200,17 +187,27 @@ class RAGS:
         self.document_loader = DocumentProcessor()
 
         self.setup_pinecone()
-        self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=self.embedding_model,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
         self.vector_store = PineconeVectorStore(index=self.index, embedding=self.embeddings)
         self.retriever = self.vector_store.as_retriever()
+
+        # For BM25, we store the document texts and will build the index once after processing all sources.
         self.bm25_corpus = []
         self.bm25 = None
 
         if tavily_api_key:
             os.environ["TAVILY_API_KEY"] = tavily_api_key
         self.web_search = TavilySearchResults(k=3)
-        # Increase max_tokens for longer outputs
-        self.llm = ChatOllama(model=self.llm_model, format="json", temperature=0.2, max_tokens=1024)
+        self.llm = ChatOllama(
+            model=self.llm_model,
+            temperature=0.2,
+            format="json",
+            system="You are a research assistant skilled in analyzing academic papers. Always respond with valid JSON."
+        )
         self.setup_rag_chain()
         self.setup_crag_chains()
 
@@ -239,8 +236,9 @@ class RAGS:
         return self.load_content(urls)
     
     def load_content(self, sources: List[str]):
-        """Load and process content from various sources"""
+        """Load and process content from various sources."""
         all_documents = []
+        corpus_texts = []  # temporary list to collect texts for BM25
 
         for source in sources:
             try:
@@ -264,12 +262,10 @@ class RAGS:
                 except Exception as e:
                     logger.error(f"Error adding to vector store: {e}")
                     raise
-                
-                texts = [doc.page_content for doc in splits]
-                self.bm25_corpus.extend(texts)
-                self.bm25 = BM25Okapi([text.split() for text in self.bm25_corpus])
-                logger.info(f"Updated BM25 index with {len(texts)} new documents")
 
+                # Collect texts for BM25 indexing
+                new_texts = [doc.page_content for doc in splits]
+                corpus_texts.extend(new_texts)
                 all_documents.extend(splits)
 
             except Exception as e:
@@ -279,16 +275,32 @@ class RAGS:
         if not all_documents:
             raise ValueError("No documents were successfully processed")
 
+        # Build (or rebuild) the BM25 index using the complete corpus from all sources.
+        self.bm25_corpus = corpus_texts
+        tokenized_corpus = [self.custom_tokenize(text) for text in self.bm25_corpus]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+        logger.info(f"BM25 index built with {len(self.bm25_corpus)} documents")
+
         return all_documents
 
+    def custom_tokenize(self, text: str) -> List[str]:
+        """Tokenize text by lowercasing and removing punctuation."""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        tokens = text.split()
+        return tokens
+
     def setup_crag_chains(self):
-        # Updated relevance prompt for CRAG: simpler instructions to judge document relevance
-        relevance_template = (
-            "Evaluate the relevance of the provided document to the question. "
-            "If the document contains sufficient information that directly addresses the question, output a JSON object with 'score' set to 1; otherwise, set 'score' to 0.\n\n"
-            "Question: {question}\n"
-            "Document: {document}\n\n"
-            "Output:"
+        # CRAG relevance prompt for judging document relevance
+        relevance_template = ("""
+            Evaluate the relevance of the provided document to the question. On a scale of 0 to 1 (with 1 being highly relevant), output a JSON object with the key "score". Provide a brief justification if possible.
+
+                Question: {question}
+                Document: {document}
+
+                Output:
+                              """
+
         )
         self.relevance_prompt = ChatPromptTemplate.from_template(relevance_template)
         self.relevance_chain = self.relevance_prompt | self.llm | JsonOutputParser()
@@ -363,29 +375,29 @@ class RAGS:
         self.generate_queries = generate_queries
 
         final_template = """ 
-You are a highly intelligent AI assistant specialized in analyzing and explaining concepts.
-Provide a clear and detailed response using only the provided context.
+You are a highly intelligent AI assistant specialized in analyzing and explaining academic papers.
+Using only the provided context, generate a detailed explanation of the paper with the following structure:
 
-### Context:  
-{context}  
+- **Title:** A concise title for the paper.
+- **Abstract:** A brief summary of the paper, including its motivation and proposed solution.
+- **Key Concepts:** A list of the most important concepts in the paper.
+- **Relationships:** A description of how these key concepts are related.
+- **Additional Info:** If the provided context is incomplete or missing details, explain what additional information would be useful; otherwise, state that all necessary information is provided.
 
-### Question:  
-{question}  
+Ensure that your output is in valid JSON format with keys "title", "abstract", "key_concepts", "relationships", and "additional_info".
 
-### Instructions:  
-- Focus on explaining the key concepts and their relationships
-- Use clear, natural language (do not output JSON or other structured formats)
-- If the context contains only partial information, explain what aspects are covered
-- If the context doesn't provide enough information, say so directly
-- Keep the response well-structured but conversational
-"""
+### Context:
+{context}
+
+### Question:
+{question}"""
 
         prompt_final = ChatPromptTemplate.from_template(final_template)
         context_chain = RunnablePassthrough(lambda queries: self.format_docs(queries)) | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
         self.final_rag_chain = ({
                 "context": context_chain,
                 "question": itemgetter("question"),
-            } | prompt_final | self.llm | StrOutputParser())
+            } | prompt_final | self.llm | JsonOutputParser())
 
     def format_docs(self, docs: List[Union[Document, str]]) -> str:
         formatted_docs = []
@@ -404,10 +416,13 @@ Provide a clear and detailed response using only the provided context.
         if not self.bm25:
             logger.warning("BM25 index not initialized.")
             return []
-        tokenized_query = query.split()
+        tokenized_query = self.custom_tokenize(query)
         scores = self.bm25.get_scores(tokenized_query)
+        # Retrieve top_k indices based on BM25 scores
         top_docs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
-        return [Document(page_content=self.bm25_corpus[idx]) for idx, _ in top_docs]
+        retrieved = [Document(page_content=self.bm25_corpus[idx]) for idx, _ in top_docs]
+        logger.info(f"BM25 scores for query '{query}': {[scores[idx] for idx, _ in top_docs]}")
+        return retrieved
 
     def web_search_documents(self, query: str) -> List[Document]:
         try:
@@ -422,69 +437,59 @@ Provide a clear and detailed response using only the provided context.
             logger.error(f"Web search error: {e}")
             return []
 
-    def reciprocal_rank_fusion(self, results: List[List[Union[Document, str]]], k: int = 60) -> List[Document]:
+    def reciprocal_rank_fusion_direct(self, pine_results: List[Document], bm25_results: List[Document], k: int = 2) -> List[Document]:
+        """
+        Directly fuse two ranked lists (Pinecone and BM25) using Reciprocal Rank Fusion.
+        Each document's score is the sum of reciprocal ranks from both sources.
+        """
         fused_scores = {}
         doc_map = {}
-        for result_list in results:
-            for rank, doc in enumerate(result_list):
-                if not isinstance(doc, (Document, str)):
-                    logger.warning(f"Skipping invalid document type: {type(doc)}")
-                    continue
-                if isinstance(doc, str):
-                    doc = Document(page_content=doc)
-                key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
-                if key not in fused_scores:
-                    fused_scores[key] = 0
-                    doc_map[key] = doc
-                fused_scores[key] += 1 / (rank + k)
-        reranked = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
-        return [doc_map[key] for key, score in reranked]
-    
-    
-    def combine_scores(self, pine: List[Document], bm25: List[Document]):
-        """
-        Combine the scores of the two retrieval methods.
-        """
-        combined = {}
-        doc_map = {}
-        for rank, doc in enumerate(pine):
+        # Process Pinecone results
+        for rank, doc in enumerate(pine_results):
             key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
-            if key not in doc_map:
+            if key not in fused_scores:
+                fused_scores[key] = 0
                 doc_map[key] = doc
-                combined[key] = 0
-            combined[key] += 0.6 * (1 / (rank + 1))
-        
-        for rank, doc in enumerate(bm25):
+            score = 1 / (rank + k)
+            fused_scores[key] += score
+            logger.debug(f"Pinecone doc {key[:6]} rank {rank} -> score {score:.4f}")
+        # Process BM25 results
+        for rank, doc in enumerate(bm25_results):
             key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
-            if key not in doc_map:
+            if key not in fused_scores:
+                fused_scores[key] = 0
                 doc_map[key] = doc
-                combined[key] = 0
-            combined[key] += 0.4 * (1 / (rank + 1))
-        sorted_res = sorted(combined.items(), key=lambda x: x[1], reverse=True)
-        return [doc_map[key] for key, _ in sorted_res]
+            score = 1 / (rank + k)
+            fused_scores[key] += score
+            logger.debug(f"BM25 doc {key[:6]} rank {rank} -> score {score:.4f}")
+        # Log the combined scores for debugging
+        logger.info("Fusion scores:")
+        for key, score in fused_scores.items():
+            logger.info(f"Doc {key[:6]}...: {score:.4f}")
+        # Sort by final score (highest first)
+        sorted_docs = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+        return [doc_map[key] for key, score in sorted_docs]
 
     def hybrid_retrieve_for_query(self, query: str, top_k=4) -> List[Document]:
-        """hybrid retrieval for a query"""
+        """Hybrid retrieval for a query using direct RRF fusion."""
         logger.info(f"Starting hybrid retrieval for query: '{query}'")
-
         try:
-            try:
+            if hasattr(self.vector_store, 'describe_index_stats'):
                 stats = self.vector_store.describe_index_stats()
                 logger.info(f"Vector store stats: {stats}")
                 if stats.get('total_vector_count', 0) == 0:
                     logger.error("Vector store is empty!")
                     return []
-            except AttributeError:
-                logger.warning("describe_index_stats not available on the vector store; proceeding without stats check.")
-            except Exception as e:
-                logger.error(f"Error checking vector store: {e}")
+            else:
+                logger.warning("Vector store does not support describe_index_stats; skipping stats check.")
         except Exception as e:
-            logger.error(f"Error in vector store verification: {e}")
+            logger.error(f"Error checking vector store: {e}")
 
         try:
             pinecone_results = self.retriever.invoke(query, k=top_k)
             logger.info(f"Pinecone retrieved {len(pinecone_results)} documents")
-            logger.info(f"Sample Pinecone result: {pinecone_results[0].page_content[:200] if pinecone_results else 'None'}")
+            if pinecone_results:
+                logger.info(f"Sample Pinecone result: {pinecone_results[0].page_content[:200]}")
         except Exception as e:
             logger.error(f"Pinecone retrieval error: {e}")
             pinecone_results = []
@@ -492,7 +497,8 @@ Provide a clear and detailed response using only the provided context.
         try:
             bm25_results = self.bm25_retrieve(query, top_k=top_k)
             logger.info(f"BM25 retrieved {len(bm25_results)} documents")
-            logger.info(f"Sample BM25 result: {bm25_results[0].page_content[:200] if bm25_results else 'None'}")
+            if bm25_results:
+                logger.info(f"Sample BM25 result: {bm25_results[0].page_content[:200]}")
         except Exception as e:
             logger.error(f"BM25 retrieval error: {e}")
             bm25_results = []
@@ -501,18 +507,11 @@ Provide a clear and detailed response using only the provided context.
             logger.error("No results from either retriever!")
             return []
 
-        combined_results = self.combine_scores(pinecone_results, bm25_results)
-        fused = self.reciprocal_rank_fusion([combined_results])[:top_k]
-
-        if not fused:
-            logger.error("No results after fusion!")
-            return []
-
-        logger.info(f"Final fused results: {len(fused)} documents")
-        logger.info(f"Sample fused result: {fused[0].page_content[:200] if fused else 'None'}")
-
-        return fused
-
+        fused_results = self.reciprocal_rank_fusion_direct(pinecone_results, bm25_results, k=2)[:top_k]
+        logger.info(f"Final fused results: {len(fused_results)} documents")
+        if fused_results:
+            logger.info(f"Sample fused result: {fused_results[0].page_content[:200]}")
+        return fused_results
 
     def evaluate_document_relevance(self, question: str, document: Document) -> float:
         try:
@@ -602,9 +601,8 @@ Provide a clear and detailed response using only the provided context.
         logger.info(f"CRAG processing complete. Found {len(processed_docs)} relevant documents")
         return processed_docs
 
-
     def query(self, question: str) -> str:
-        """Final query answering"""
+        """Final query answering."""
         try:
             logger.info(f"Processing question: {question}")
             queries = self.generate_queries({"question": question})[:3]
@@ -629,22 +627,26 @@ Provide a clear and detailed response using only the provided context.
                 "question": question,
                 "context": self.format_docs(relevant_docs)
             })
-        
-            if raw_answer.strip().startswith('{'):
-                try:
-                    answer_json = json.loads(raw_answer)
-                    if isinstance(answer_json, dict):
-                        if 'context' in answer_json:
-                            return answer_json['context']
-                        for key in ['answer', 'response', 'content', 'text']:
-                            if key in answer_json:
-                                return answer_json[key]
-                except json.JSONDecodeError:
-                    pass
-                    
-            return raw_answer.strip()
             
+            # Try to parse the output as JSON
+            if isinstance(raw_answer, dict):
+                answer_json = raw_answer
+            else:
+                raw_answer_str = raw_answer.strip()
+                try:
+                    answer_json = json.loads(raw_answer_str)
+                except json.JSONDecodeError:
+                    answer_json = None
 
+            if answer_json is not None and isinstance(answer_json, dict):
+                expected_keys = ['title', 'abstract', 'key_concepts', 'relationships', 'additional_info']
+                if all(key in answer_json for key in expected_keys):
+                    return json.dumps(answer_json, indent=2)
+                else:
+                    return json.dumps(answer_json, indent=2)
+            
+            return raw_answer if isinstance(raw_answer, str) else json.dumps(raw_answer, indent=2)
+            
         except Exception as e:
             logger.error(f"Error in query processing: {str(e)}")
             return f"An error occurred while processing your query: {str(e)}"
@@ -652,14 +654,14 @@ Provide a clear and detailed response using only the provided context.
 
 def main():
     rag_system = RAGS(tavily_api_key="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")
-    sources = ["pasa.pdf"]
+    sources = ["https://lilianweng.github.io/posts/2023-06-23-agent/"]
     try:
         documents = rag_system.load_content(sources)
         logger.info(f"Loaded {len(documents)} document chunks from the provided sources.")
     except Exception as e:
         logger.error(f"Error loading content: {e}")
         documents = []
-    question = "explain about this paper?"
+    question = "explain about task decomposition?"
     try:
         answer = rag_system.query(question)
         print("Final Answer:")
