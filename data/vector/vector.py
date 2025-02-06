@@ -60,10 +60,11 @@ def parse_queries(raw_output: str) -> List[str]:
         lines = [line.strip() for line in raw_output.split('\n') if line.strip()]
         return lines
     return []
+
+
 class DocumentProcessingError(Exception):
     """Custom exception for document processing errors"""
     pass
-
 
 
 class DocumentProcessor:
@@ -97,7 +98,7 @@ class DocumentProcessor:
             try:
                 loader = Docx2txtLoader(file_path)
                 documents = loader.load()
-            except:
+            except Exception:
                 loader = UnstructuredWordDocumentLoader(file_path)
                 documents = loader.load()
             
@@ -185,7 +186,7 @@ class RAGS:
         embedding_model: str = "BAAI/bge-m3",
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
-        relevance_threshold: float = 0.6,
+        relevance_threshold: float = 0.5,  # lowered threshold
         tavily_api_key: str = None
     ):
         self.index_name = index_name
@@ -238,9 +239,9 @@ class RAGS:
     
     def load_content(self, sources: List[str]):
         """
-        Load content from different sources
-        sources: list of file paths or URLs
-        Will stop execution if any document fails to process
+        Load content from different sources.
+        sources: list of file paths or URLs.
+        Will stop execution if any document fails to process.
         """
         all_documents = []
         
@@ -301,23 +302,30 @@ class RAGS:
         return all_documents
 
     def setup_crag_chains(self):
-        relevance_template = (
-            "You are an expert document evaluator. For the given question and document, output only a valid JSON object "
-            "with a single key \"score\". The score must be a floating point number between 0 and 1, where 0 means "
-            "the document is completely irrelevant and 1 means it is highly relevant.\n\n"
-            "Question: {question}\n"
-            "Document: {document}\n\n"
-            "Output:"
-        )
+        relevance_template = ("""
+           Assume you are a human expert in grading predictions given by a model. You are given a question and a model prediction. Judge if the prediction matches the ground truth answer by following these steps:
+        1: Take it as granted that the Ground Truth is always correct.
+        2: If the Prediction indicates it is not sure about the answer, "score" should be "0"; otherwise, go the next step.
+        3: If the Prediction exactly matches the Ground Truth, "score" is 1.
+        4: If the Prediction does not exactly match the Ground Truth, go through the following steps and likely give a score as 0.
+        5: If the Ground Truth is a number, "score" is 1 if and only if the Prediction gives a number that almost exactly matches the ground truth.
+        6: If the Prediction is self-contradictory, "score" must be 0.
+        7: If the prediction is not answering the question, "score" must be 0.
+        8: If the prediction is a concise and correct summary of the ground truth, "score" is 1.
+        9: If ground truth contains a set of items, prediction must contain exactly same items for the score to be 1.
+        10: Otherwise, "score" is 0.
+
+        ### Output a JSON blob with an "explanation" field explaining your answer as short as possible and an "score" field with value 1 or 0.
+     """   )
         self.relevance_prompt = ChatPromptTemplate.from_template(relevance_template)
         self.relevance_chain = self.relevance_prompt | self.llm | JsonOutputParser()
 
         strip_template = (
             "Break this document into distinct knowledge units (strips) that relate to answering the question. "
-            "Each strip should be self-contained and coherent.\n\n"
+            "Each strip should be a complete and coherent bullet point. List each strip on a new line prefixed with a dash (-).\n\n"
             "Question: {question}\n"
             "Document: {document}\n\n"
-            "Format each knowledge strip as a separate bullet point."
+            "Output:"
         )
         self.strip_prompt = ChatPromptTemplate.from_template(strip_template)
         self.strip_chain = self.strip_prompt | self.llm | StrOutputParser()
@@ -352,7 +360,6 @@ class RAGS:
 
         rewrite_query_chain = rewrite_query_with_logging
 
-        # Updated multi-query prompt: force JSON output with exactly 4 queries.
         multi_query_generation_template = (
             "Generate exactly 4 distinct search queries related to the topic below. Each query should cover a different aspect of the topic. "
             "Output a JSON object with a key \"queries\" mapping to an array of exactly 4 query strings. Do not include any additional keys.\n\n"
@@ -382,14 +389,25 @@ class RAGS:
 
         self.generate_queries = generate_queries
 
-        final_template = (
-            "You are an expert assistant. Using the context provided, compose a comprehensive, detailed, and well-structured answer in plain text. "
-            "Your answer should be at least 500 words long and include examples, benefits, potential pitfalls, and real-world applications of task decomposition. "
-            "If the context is insufficient, say \"I don't have enough information to answer this question accurately.\" \n\n"
-            "Context:\n{context}\n\n"
-            "Question: {question}\n\n"
-            "Answer (please be as detailed as possible):"
-        )
+        final_template = """ 
+        
+        You are a highly intelligent and precise AI assistant. Answer the given question using only the provided context.  
+
+    ### Context:  
+    {context}  
+    
+    ### Question:  
+    {question}  
+    
+    ### Instructions:  
+    - Use only the information from the context. Do not use prior knowledge.  
+    - If the answer is in the context, provide a clear and well-structured response.  
+    - If the context does not contain the answer, say: "The context does not provide sufficient information."  
+    - Keep the response concise and to the point while maintaining completeness.  
+
+         """
+
+
         prompt_final = ChatPromptTemplate.from_template(final_template)
         context_chain = RunnablePassthrough(lambda queries: self.format_docs(queries)) | (lambda docs: self.format_docs(docs) if isinstance(docs, list) else str(docs))
         self.final_rag_chain = ({
@@ -451,9 +469,9 @@ class RAGS:
         return [doc_map[key] for key, score in reranked]
     
     
-    def combine_scores(self,pine:List[Document],bm25:List[Document]):
+    def combine_scores(self, pine: List[Document], bm25: List[Document]):
         """
-        Combine the scores of the two retrieval methods
+        Combine the scores of the two retrieval methods.
         """
         combined = {}
         doc_map = {}
@@ -461,26 +479,21 @@ class RAGS:
             key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
             if key not in doc_map:
                 doc_map[key] = doc
-                combined[key]=0
-            combined[key] += 0.6*(1/ (rank + 1))
+                combined[key] = 0
+            combined[key] += 0.6 * (1 / (rank + 1))
         
         for rank, doc in enumerate(bm25):
-            key=hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
+            key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
             if key not in doc_map:
                 doc_map[key] = doc
-                combined[key]=0
-            combined[key] += 0.4*(1/ (rank + 1))
-        sorted_res=sorted(combined.items(), key=lambda x: x[1], reverse=True)
+                combined[key] = 0
+            combined[key] += 0.4 * (1 / (rank + 1))
+        sorted_res = sorted(combined.items(), key=lambda x: x[1], reverse=True)
         return [doc_map[key] for key, _ in sorted_res]
 
-
-
-
-
-
-    def hybrid_retrieve_for_query(self, query: str,top_k=4) -> List[Document]:
+    def hybrid_retrieve_for_query(self, query: str, top_k=4) -> List[Document]:
         logger.info(f"Hybrid retrieval for query: '{query}'")
-        pinecone_results = self.retriever.invoke(query,top_k=4)
+        pinecone_results = self.retriever.invoke(query, k=top_k)
         logger.info(f"Pinecone retrieved {len(pinecone_results)} documents for query: '{query}'")
         pinecone_results = [
             Document(page_content=result.page_content) if isinstance(result, Document)
@@ -488,12 +501,11 @@ class RAGS:
             else result
             for result in pinecone_results
         ]
-        bm25_results = self.bm25_retrieve(query)
+        bm25_results = self.bm25_retrieve(query, top_k=top_k)
         logger.info(f"BM25 retrieved {len(bm25_results)} documents for query: '{query}'")
         
-        combined_results = self.combine_scores(pinecone_results,bm25_results)
-
-        fused = self.reciprocal_rank_fusion([combined_results])
+        combined_results = self.combine_scores(pinecone_results, bm25_results)
+        fused = self.reciprocal_rank_fusion([combined_results])[:top_k]
         logger.info(f"Fused result contains {len(fused)} documents for query: '{query}'")
         return fused
 
@@ -516,7 +528,12 @@ class RAGS:
                 "document": document.page_content
             })
             logger.info(f"Raw knowledge strips response: {raw_response}")
-            strips = [strip.strip().lstrip('•-* ') for strip in raw_response.split('\n') if strip.strip() and not strip.isspace()]
+            # Expect each bullet to start with a dash (-)
+            lines = raw_response.split('\n')
+            strips = [line.strip().lstrip('-').strip() for line in lines if line.strip() and line.startswith('-')]
+            # Fallback: if no dash found, split on newline
+            if not strips:
+                strips = [line.strip() for line in lines if line.strip()]
             return strips
         except Exception as e:
             logger.error(f"Error creating knowledge strips: {e}")
@@ -538,14 +555,16 @@ class RAGS:
         logger.info("Starting CRAG document processing")
         processed_docs = []
         need_web_search = True
-        for doc in documents:
+
+        # Process the retrieved documents using CRAG
+        for doc in documents[:4]:
             relevance_score = self.evaluate_document_relevance(question, doc)
             logger.info(f"Document relevance score: {relevance_score}")
             if relevance_score >= self.relevance_threshold:
                 need_web_search = False
                 strips = self.create_knowledge_strips(question, doc)
                 relevant_strips = []
-                for strip in strips:
+                for strip in strips[:5]:
                     strip_score = self.evaluate_strip_relevance(question, strip)
                     logger.info(f"Knowledge strip relevance score: {strip_score} for strip: {strip}")
                     if strip_score >= self.relevance_threshold:
@@ -557,13 +576,15 @@ class RAGS:
                     ))
             elif relevance_score == -1:
                 need_web_search = True
-        if need_web_search:
-            logger.info("No highly relevant documents found or uncertain relevance, performing web search")
-            web_docs = self.web_search_documents(question)
+
+        # If the flag indicates we need web search, or if no processed docs are available, then perform web search
+        if need_web_search or not processed_docs:
+            logger.info("CRAG processing did not yield sufficient results; performing web search fallback.")
+            web_docs = self.web_search_documents(question)[:3]
             for doc in web_docs:
                 strips = self.create_knowledge_strips(question, doc)
                 relevant_strips = []
-                for strip in strips:
+                for strip in strips[:5]:
                     strip_score = self.evaluate_strip_relevance(question, strip)
                     logger.info(f"Web knowledge strip relevance score: {strip_score} for strip: {strip}")
                     if strip_score >= self.relevance_threshold:
@@ -573,30 +594,43 @@ class RAGS:
                         page_content="\n".join(relevant_strips),
                         metadata={**doc.metadata, "source": "web_search", "processed_by_crag": True}
                     ))
+
+        # Final fallback: if still no processed documents, use the top retrieved documents.
+        if not processed_docs:
+            logger.warning("CRAG processing and web search fallback produced no processed documents; falling back to top retrieved documents.")
+            processed_docs = documents[:3]
         logger.info(f"CRAG processing complete. Found {len(processed_docs)} relevant documents")
         return processed_docs
+
 
     def query(self, question: str) -> str:
         try:
             logger.info(f"Processing question: {question}")
-            queries = self.generate_queries({"question": question})
+            queries = self.generate_queries({"question": question})[:3]
             logger.info(f"Generated queries: {queries}")
+            
             all_retrieved_docs = []
+
             for query in queries:
-                retrieved_docs = self.hybrid_retrieve_for_query(query)
+                retrieved_docs = self.hybrid_retrieve_for_query(query, top_k=3)
                 all_retrieved_docs.extend(retrieved_docs)
-            reranked_docs = self.reciprocal_rank_fusion([all_retrieved_docs])
+           
+            reranked_docs = self.reciprocal_rank_fusion([all_retrieved_docs])[:5]
+           
             relevant_docs = self.process_with_crag(question, reranked_docs)
             if not relevant_docs:
                 logger.warning("No relevant documents found after CRAG processing")
                 return "I couldn't find any relevant information to answer your question accurately."
-            # Sort by relevance score stored in metadata and only take top 3 documents.
+
             sorted_docs = sorted(relevant_docs, key=lambda d: d.metadata.get("relevance_score", 0), reverse=True)[:3]
+           
             answer = self.final_rag_chain.invoke({
                 "question": question,
                 "context": self.format_docs(sorted_docs)
             })
+          
             logger.info("Generated answer using enhanced retrieval and CRAG")
+          
             return answer
         except Exception as e:
             logger.error(f"Error in query processing: {str(e)}")
@@ -608,9 +642,9 @@ def main():
     sources = ["pasa.pdf"]
     try:
         documents = rag_system.load_content(sources)
-        logger.info(f"Loaded {len(documents)} document chunks from the provided URLs.")
+        logger.info(f"Loaded {len(documents)} document chunks from the provided sources.")
     except Exception as e:
-        logger.error(f"Error loading web content: {e}")
+        logger.error(f"Error loading content: {e}")
         documents = []
     question = "give a summary about the paper?"
     try:
