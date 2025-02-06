@@ -410,7 +410,7 @@ class RAGS:
             formatted_docs.append(f"Document {i}:\n{content}")
         return "\n\n---\n\n".join(formatted_docs)
 
-    def bm25_retrieve(self, query: str, top_k: int = 10) -> List[Document]:
+    def bm25_retrieve(self, query: str, top_k: int = 4) -> List[Document]:
         if not self.bm25:
             logger.warning("BM25 index not initialized.")
             return []
@@ -449,10 +449,38 @@ class RAGS:
                 fused_scores[key] += 1 / (rank + k)
         reranked = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
         return [doc_map[key] for key, score in reranked]
+    
+    
+    def combine_scores(self,pine:List[Document],bm25:List[Document]):
+        """
+        Combine the scores of the two retrieval methods
+        """
+        combined = {}
+        doc_map = {}
+        for rank, doc in enumerate(pine):
+            key = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
+            if key not in doc_map:
+                doc_map[key] = doc
+                combined[key]=0
+            combined[key] += 0.6*(1/ (rank + 1))
+        
+        for rank, doc in enumerate(bm25):
+            key=hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
+            if key not in doc_map:
+                doc_map[key] = doc
+                combined[key]=0
+            combined[key] += 0.4*(1/ (rank + 1))
+        sorted_res=sorted(combined.items(), key=lambda x: x[1], reverse=True)
+        return [doc_map[key] for key, _ in sorted_res]
 
-    def hybrid_retrieve_for_query(self, query: str) -> List[Document]:
+
+
+
+
+
+    def hybrid_retrieve_for_query(self, query: str,top_k=4) -> List[Document]:
         logger.info(f"Hybrid retrieval for query: '{query}'")
-        pinecone_results = self.retriever.invoke(query)
+        pinecone_results = self.retriever.invoke(query,top_k=4)
         logger.info(f"Pinecone retrieved {len(pinecone_results)} documents for query: '{query}'")
         pinecone_results = [
             Document(page_content=result.page_content) if isinstance(result, Document)
@@ -462,7 +490,10 @@ class RAGS:
         ]
         bm25_results = self.bm25_retrieve(query)
         logger.info(f"BM25 retrieved {len(bm25_results)} documents for query: '{query}'")
-        fused = self.reciprocal_rank_fusion([pinecone_results, bm25_results])
+        
+        combined_results = self.combine_scores(pinecone_results,bm25_results)
+
+        fused = self.reciprocal_rank_fusion([combined_results])
         logger.info(f"Fused result contains {len(fused)} documents for query: '{query}'")
         return fused
 
