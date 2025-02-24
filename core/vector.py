@@ -2,7 +2,7 @@ import os
 import getpass
 import time
 import logging
-from typing import List, Union, Dict
+from typing import List, Union, Dict, Tuple
 from operator import itemgetter
 import hashlib
 import json
@@ -16,7 +16,6 @@ from langchain_community.document_loaders import (
     CSVLoader,
     WebBaseLoader
 )
-from langchain_docling import DoclingLoader
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -28,7 +27,6 @@ from langchain.prompts import ChatPromptTemplate, PromptTemplate
 from pinecone import Pinecone, ServerlessSpec
 from rank_bm25 import BM25Okapi
 from langchain_community.tools.tavily_search import TavilySearchResults
-import docling as dl
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,7 +81,6 @@ class DocumentProcessor:
 
     def load_pdf(self, file_path: str) -> List[Document]:
         """Post-process extracted text from PDF."""
-        
         try:
             loader = PyPDFLoader(file_path)
             docs = loader.load()
@@ -170,6 +167,8 @@ class DocumentProcessor:
             raise ValueError(f"Unsupported file format: {extension}")
 
         return self.supported_extensions[extension](source)
+
+
 
 
 class RAGS:
@@ -298,6 +297,39 @@ class RAGS:
         tokens = text.split()
         return tokens
 
+    
+
+    def extract_sources_from_docs(self, docs: List[Document]) -> List[Dict]:
+        """Extract source information from documents."""
+        sources = []
+        for doc in docs:
+            source_info = {
+                'content': doc.page_content[:500] + "...",  # Increased preview length
+                'type': doc.metadata.get('source_type', 'unknown'),
+                'relevance': doc.metadata.get('relevance_score', None),
+                'source': None
+            }
+            
+            # Prioritize URL source
+            if 'url' in doc.metadata:
+                source_info.update({
+                    'source': doc.metadata['url'],
+                    'type': 'web'
+                })
+            elif 'file_path' in doc.metadata:
+                source_info.update({
+                    'source': os.path.basename(doc.metadata['file_path']),
+                    'type': 'file'
+                })
+            elif 'source' in doc.metadata:  # For web search results
+                source_info['source'] = doc.metadata['source']
+                
+            sources.append(source_info)
+        return sources
+    
+
+    
+
     def setup_crag_chains(self):
         # CRAG relevance prompt for judging document relevance
         relevance_template = ("""
@@ -344,24 +376,15 @@ class RAGS:
             Document Context: {document_chunk}
             Query: {question}
 
-            Return your analysis in this JSON format:
-            {
-                "intent": "what the user actually wants to do with the information",
-                "search_terms": ["list", "of", "actual", "concepts", "to", "search", "for"],
-                "expanded_query": "a more specific search query that will find relevant content"
-            }
+            Return your analysis in JSON format with the following structure:
+            {{"intent": "what the user actually wants to do with the information",
+              "search_terms": ["list", "of", "actual", "concepts", "to", "search", "for"],
+              "expanded_query": "a more specific search query that will find relevant content"}}
 
-            For example:
-            Query: "give me a summary"
-            Would return:
-            {
-                "intent": "get main topics and key points from the document",
-                "search_terms": ["main topics", "key concepts", "central themes"],
-                "expanded_query": "identify main topics key concepts central themes in the document context"
-            }
+            
 
-            JSON Response:
-        """
+            JSON Response:"""
+
         self.query_intent_prompt = ChatPromptTemplate.from_template(query_intent_template)
         self.query_intent_chain = self.query_intent_prompt | self.llm | JsonOutputParser()
 
@@ -379,22 +402,31 @@ class RAGS:
 
         # Modified query rewrite template to use the processed intent
         query_rewrite_template = """
-            You are a helpful research assistant that rewrites queries to be clearer and more specific to the document context.
-            Use both the document summary and the query intent to create a focused search query.
+You are a helpful research assistant that rewrites queries to be clearer and more specific, based on the document context provided below.
 
-            Document Summary: {document_summary}
-            Query Intent: {query_intent}
-            Original Query: {question}
+Please carefully review the following information:
 
-            IMPORTANT: Output the rewritten query in JSON format as {{"query": "your rewritten query"}}.
-            The rewritten query should:
-            1. Focus on the actual concepts to search for
-            2. Use terminology from the document context
-            3. Be specific to the document's subject matter
-            4. Avoid generic terms like "summary", "explain", "tell me about"
+**Document Summary:**  
+{document_summary}
 
-            Rewritten Query:
-        """
+**Query Intent Analysis:**  
+{query_intent}
+
+**Original Query:**  
+{question}
+
+Based on the above context, rewrite the query so that it:
+1. Focuses on the key concepts identified.
+2. Uses terminology directly from the document summary.
+3. Is specific and tailored to the document’s subject matter.
+4. Avoids generic terms like "summary", "explain", or "tell me about".
+
+IMPORTANT: Output your rewritten query in strict JSON format as follows:  
+{{"query": "your rewritten query"}}
+
+Rewritten Query:
+"""
+
         self.prompt_rewrite = ChatPromptTemplate.from_template(query_rewrite_template)
         self.rewrite_query_chain = self.prompt_rewrite | self.llm | StrOutputParser()
 
@@ -416,12 +448,15 @@ You are a highly intelligent AI research assistant specialized in deeply analyzi
 Using the provided context from multiple academic sources, generate a detailed, comprehensive, and well-structured explanation of at least 600-800 words (8-10 paragraphs) that:
 
 1. **Directly and thoroughly answers the question:** {question}
-2. **Synthesizes information from all provided sources** to create a cohesive and integrated explanation. Do not just summarize each document individually.
+2. **Synthesizes information from all provided sources** to create a cohesive and integrated explanation.
 3. **Provides specific examples and evidence** from the context to support your points.
-4. **Clearly explains any technical terms or jargon** that might be present in the context or necessary for a complete understanding.
-5. **Includes in-line citations** to the documents in the context to clearly indicate the source of each piece of information. For example, use citations like '(Document 1)' or '(Document 2)'.
+4. **Clearly explains any technical terms or jargon** that might be present.
+5. **Includes detailed in-line citations** to clearly indicate the source of information. Use the following format:
+   - For web sources: ([Document X - URL: domain.com])
+   - For papers: ([Document X - Paper: title])
+   - For other files: ([Document X - File: filename])
 
-Structure your response in Markdown format. Ensure a logical flow and clear organization into paragraphs. Focus on depth, clarity, and accuracy.
+Structure your response in Markdown format. Ensure a logical flow and clear organization into paragraphs.
 
 ### Context:
 {context}
@@ -440,53 +475,53 @@ Structure your response in Markdown format. Ensure a logical flow and clear orga
     def generate_queries(self, input_dict: dict) -> List[str]:
         try:
             question = input_dict["question"]
-    
+
             # Get document context
-            retrieved_docs = self.hybrid_retrieve_for_query("document summary context", top_k=1)
-            first_document_split = retrieved_docs[0].page_content if retrieved_docs else ""
-    
-            if first_document_split:
-                # Get document summary
-                document_summary = self.document_summary_chain.invoke({"document_chunk": first_document_split})
-                logger.info(f"Document Summary: {document_summary}")
-    
-                # Get query intent
-                query_intent_result = self.query_intent_chain.invoke({
-                    "question": question,
-                    "document_chunk": first_document_split
-                })
-                logger.info(f"Query Intent Analysis: {query_intent_result}")
-    
-                # Rewrite query with both context and intent
-                rewritten_query_output = self.rewrite_query_chain.invoke({
-                    "question": question,
-                    "document_summary": document_summary,
-                    "query_intent": json.dumps(query_intent_result)
-                })
-                rewritten_query = parse_rewritten_query(rewritten_query_output)
-                logger.info(f"Rewritten Query: {rewritten_query}")
-    
-                # Generate multiple queries using rewritten query and document context
-                raw_queries = (self.prompt_multi_query | self.llm | StrOutputParser()).invoke({
-                    "rewritten_query": rewritten_query,
-                    "document_summary": document_summary
-                })
-                queries = parse_queries(raw_queries)
-    
-                if len(queries) != 4:
-                    logger.warning("Did not get exactly 4 queries; falling back to using original and rewritten query.")
-                    return [question, rewritten_query]
-    
-                final_queries = [rewritten_query] + queries
-                seen = set()
-                unique_queries = [q for q in final_queries if not (q in seen or seen.add(q))]
-                logger.info(f"Final Queries: {unique_queries}")
-                return unique_queries
-    
-            else:
-                logger.warning("No document context available. Using original query.")
+            retrieved_docs = self.hybrid_retrieve_for_query("document summary", top_k=1)
+
+            if not retrieved_docs:
+                logger.warning("No documents retrieved for summary context")
                 return [question]
-    
+
+            first_document_split = retrieved_docs[0].page_content
+
+            # Get document summary
+            document_summary = self.document_summary_chain.invoke({"document_chunk": first_document_split})
+            logger.info(f"Document Summary: {document_summary}")
+
+            # Get query intent
+            query_intent_result = self.query_intent_chain.invoke({
+                "document_chunk": first_document_split,
+                "question": question
+            })
+            logger.info(f"Query Intent Analysis: {query_intent_result}")
+
+            # Rewrite query with both context and intent
+            rewritten_query_output = self.rewrite_query_chain.invoke({
+                "question": question,
+                "document_summary": document_summary,
+                "query_intent": json.dumps(query_intent_result)
+            })
+            rewritten_query = parse_rewritten_query(rewritten_query_output)
+            logger.info(f"Rewritten Query: {rewritten_query}")
+
+            # Generate multiple queries
+            raw_queries = (self.prompt_multi_query | self.llm | StrOutputParser()).invoke({
+                "rewritten_query": rewritten_query,
+                "document_summary": document_summary
+            })
+            queries = parse_queries(raw_queries)
+
+            if len(queries) != 4:
+                logger.warning("Did not get exactly 4 queries; falling back to using original and rewritten query.")
+                return [question, rewritten_query]
+
+            final_queries = [rewritten_query] + queries
+            seen = set()
+            unique_queries = [q for q in final_queries if not (q in seen or seen.add(q))]
+            logger.info(f"Final Queries: {unique_queries}")
+            return unique_queries
+
         except Exception as e:
             logger.error(f"Error in query generation: {str(e)}")
             return [question]
@@ -496,12 +531,19 @@ Structure your response in Markdown format. Ensure a logical flow and clear orga
         for i, doc in enumerate(docs, start=1):
             if isinstance(doc, Document):
                 content = doc.page_content.strip()
+                source_info = ""
+
+                # Extract source information
+                if 'url' in doc.metadata:
+                    source_info = f"Source URL: {doc.metadata['url']}"
+                elif 'file_path' in doc.metadata:
+                    source_info = f"Source File: {os.path.basename(doc.metadata['file_path'])}"
+                elif 'source' in doc.metadata:
+                    source_info = f"Source: {doc.metadata['source']}"
+
+                formatted_docs.append(f"Document {i}:\n{content}\n[{source_info}]")
             elif isinstance(doc, str):
-                content = doc.strip()
-            else:
-                logger.warning(f"Skipping document of unexpected type: {type(doc)}")
-                continue
-            formatted_docs.append(f"Document {i}:\n{content}")
+                formatted_docs.append(f"Document {i}:\n{doc.strip()}")
         return "\n\n---\n\n".join(formatted_docs)
 
     def bm25_retrieve(self, query: str, top_k: int = 8) -> List[Document]: # Increased top_k for BM25
@@ -657,7 +699,7 @@ Structure your response in Markdown format. Ensure a logical flow and clear orga
                         page_content="\n".join(relevant_strips),
                         metadata={**doc.metadata, "relevance_score": relevance_score, "processed_by_crag": True}
                     ))
-            elif relevance_score == -1: # This condition likely needs review - relevance_score from evaluate_document_relevance should be between 0 and 1, not -1.  It might be a placeholder or error.
+            elif relevance_score == -1:
                 need_web_search = True
 
         if need_web_search or not processed_docs:
@@ -684,39 +726,64 @@ Structure your response in Markdown format. Ensure a logical flow and clear orga
         return processed_docs
 
 
-    def query(self, question: str) -> str:
-
+    def query(self, question: str) -> Tuple[str, List[Dict]]:
+        """Modified query method that returns both the answer and source information."""
         try:
             logger.info(f"Processing question: {question}")
-            queries = self.generate_queries({"question": question})[:3] # Call generate_queries method correctly
+            queries = self.generate_queries({"question": question})[:3]
             if not queries:
                 raise ValueError("No queries generated")
-            logger.info(f"Generated queries: {queries}")
-
+            
             all_retrieved_docs = []
             for query in queries:
-                docs = self.hybrid_retrieve_for_query(query, top_k=4) # Increased top_k in query function as well
+                docs = self.hybrid_retrieve_for_query(query, top_k=4)
                 if docs:
                     all_retrieved_docs.extend(docs)
 
             if not all_retrieved_docs:
-                return "No relevant information found in the indexed documents."
+                return "No relevant information found in the indexed documents.", []
 
             relevant_docs = self.process_with_crag(question, all_retrieved_docs)
             if not relevant_docs:
-                return "Could not find relevant information after CRAG processing."
+                return "Could not find relevant information after CRAG processing.", []
+
+            # Extract source information before processing the answer
+            sources = self.extract_sources_from_docs(relevant_docs)
 
             raw_answer = self.final_rag_chain.invoke({
                 "question": question,
-                "queries": relevant_docs 
+                "queries": relevant_docs
             })
 
-
-            return raw_answer if isinstance(raw_answer, str) else json.dumps(raw_answer, indent=2)
+            answer = raw_answer if isinstance(raw_answer, str) else json.dumps(raw_answer, indent=2)
+            
+            return answer, sources
 
         except Exception as e:
             logger.error(f"Error in query processing: {str(e)}")
-            return f"An error occurred while processing your query: {str(e)}"
+            return f"An error occurred while processing your query: {str(e)}", []   
+    
+
+    def clear_index(self):
+        """
+        Clears the Pinecone index by deleting all vectors.
+        Should be called when you want to start fresh with new documents.
+        """
+        try:
+            # Delete all vectors in the index
+            self.vector_store.delete(delete_all=True)
+
+            # Reset any stored documents or cached data
+            self.documents = []
+
+            # Wait a moment for deletion to complete
+            time.sleep(1)
+
+            return True
+
+        except Exception as e:
+            logging.error(f"Error clearing Pinecone index: {str(e)}")
+            raise Exception(f"Failed to clear index: {str(e)}")
 
 
 def main():
@@ -725,17 +792,22 @@ def main():
     try:
         documents = rag_system.load_content(sources)
         logger.info(f"Loaded {len(documents)} document chunks from the provided sources.")
-    except Exception as e:
+    except Exception as e:  
         logger.error(f"Error loading content: {e}")
         documents = []
-    question = "explain about task decomposition in this article"
+    question = "explain about task decomposition in agents"
     try:
-        answer = rag_system.query(question)
+        answer, sources = rag_system.query(question)
         print("Final Answer:")
         print(answer)
+        print("\nSources Used:")
+        for source in sources:
+            print(f"- Type: {source['type']}")
+            print(f"  Source: {source.get('source', 'Unknown')}")
+            print(f"  Relevance: {source.get('relevance_score', 'N/A')}")
+            print(f"  Preview: {source['content_preview']}\n")
     except Exception as e:
         print(f"An error occurred while processing the query: {e}")
-
 
 if __name__ == "__main__":
     main()
