@@ -4,6 +4,10 @@ from vector import RAGS
 import logging
 import os
 from typing import Dict, List
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 def load_css():
     st.markdown("""
@@ -66,7 +70,8 @@ def initialize_session_state():
         st.session_state.messages = []
         
     if "rag_system" not in st.session_state:
-        st.session_state.rag_system = RAGS(tavily_api_key="tvly-...")  # Add your API key
+        tavily_api_key = os.getenv("TAVILY_API_KEY")
+        st.session_state.rag_system = RAGS(tavily_api_key=tavily_api_key)
         
     if "document_sources" not in st.session_state:
         st.session_state.document_sources = set()

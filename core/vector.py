@@ -10,6 +10,10 @@ import sys
 import re
 import chardet
 import bs4
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from langchain_community.document_loaders import (
     PyPDFLoader,
@@ -19,11 +23,11 @@ from langchain_community.document_loaders import (
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnablePassthrough
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import ChatOllama
-from langchain_pinecone import PineconeVectorStore
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_community.vectorstores.pinecone import Pinecone as PineconeVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from pinecone import Pinecone, ServerlessSpec
 from rank_bm25 import BM25Okapi
 from langchain_community.tools.tavily_search import TavilySearchResults
@@ -215,10 +219,14 @@ class RAGS:
         self.setup_crag_chains()
 
     def setup_pinecone(self):
-        if not os.getenv("PINECONE_API_KEY"):
-            os.environ["PINECONE_API_KEY"] = getpass.getpass("Enter your Pinecone API key: ")
+        """Set up connection to Pinecone"""
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        if not pinecone_api_key:
+            pinecone_api_key = getpass.getpass("Enter your Pinecone API key: ")
+            os.environ["PINECONE_API_KEY"] = pinecone_api_key
+            
         try:
-            self.pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+            self.pc = Pinecone(api_key=pinecone_api_key)
             existing_indexes = [index_info["name"] for index_info in self.pc.list_indexes()]
             if self.index_name not in existing_indexes:
                 logger.info(f"Creating new Pinecone index: {self.index_name}")
@@ -300,7 +308,7 @@ class RAGS:
     
 
     def extract_sources_from_docs(self, docs: List[Document]) -> List[Dict]:
-        """Extract source information from documents."""
+        """Extract source information from documents."""  
         sources = []
         for doc in docs:
             source_info = {
