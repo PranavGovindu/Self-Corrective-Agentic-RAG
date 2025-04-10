@@ -1,13 +1,18 @@
 # ui.py
 import streamlit as st
+# Ensure vector module is importable (e.g., same directory or in sys.path)
 from vector import RAGS
 import logging
 import os
-from typing import Dict, List
+from typing import Dict, List, Set
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging for Streamlit app if needed
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def load_css():
     st.markdown("""
@@ -15,16 +20,18 @@ def load_css():
         .stApp {
             max-width: 1200px;
             margin: 0 auto;
+            padding: 1rem;
         }
         .chat-container {
             border-radius: 10px;
-            padding: 20px;
-            background-color: #f5f5f5;
+            padding: 15px; /* Slightly reduced padding */
+            background-color: #f8f9fa; /* Lighter background */
             margin: 10px 0;
+            border: 1px solid #e9ecef; /* Subtle border */
         }
         .metadata-container {
             font-size: 0.8em;
-            color: #666;
+            color: #6c757d; /* Adjusted color */
             margin-top: 5px;
         }
         .source-citation {
@@ -34,32 +41,44 @@ def load_css():
             font-size: 0.85em;
             margin: 0 2px;
             cursor: pointer;
+            border: 1px solid #b8dfff; /* Add subtle border */
+            display: inline-block; /* Ensure proper spacing */
         }
         .reference-container {
-            border-left: 3px solid #0066cc;
+            border-left: 3px solid #007bff; /* Updated color */
             padding: 10px;
             margin: 10px 0;
             background-color: #f8f9fa;
+            border-radius: 5px; /* Added border radius */
         }
         .reference-header {
             font-weight: bold;
-            color: #0066cc;
+            color: #0056b3; /* Darker blue */
             margin-bottom: 5px;
+            word-wrap: break-word; /* Prevent long source names from overflowing */
         }
         .reference-content {
             font-size: 0.9em;
-            color: #333;
+            color: #343a40; /* Darker text */
             max-height: 150px;
             overflow-y: auto;
+            background-color: #ffffff; /* White background for contrast */
+            padding: 5px;
+            border-radius: 3px;
+            border: 1px solid #dee2e6;
         }
         .reference-metadata {
             font-size: 0.8em;
-            color: #666;
+            color: #6c757d;
             margin-top: 5px;
         }
         .stSpinner > div {
             text-align: center;
             margin: 20px 0;
+        }
+        /* Ensure text area has reasonable height */
+        .stTextArea textarea {
+             min-height: 100px !important;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -68,82 +87,138 @@ def initialize_session_state():
     """Initialize all required session state variables"""
     if "messages" not in st.session_state:
         st.session_state.messages = []
-        
+
     if "rag_system" not in st.session_state:
         tavily_api_key = os.getenv("TAVILY_API_KEY")
-        st.session_state.rag_system = RAGS(tavily_api_key=tavily_api_key)
-        
+        pinecone_api_key = os.getenv("PINECONE_API_KEY") # Ensure Pinecone key is available too
+
+        if not tavily_api_key:
+             logger.warning("Tavily API key not found in environment. Web search will be disabled.")
+             # Optionally display a warning in the UI:
+             # st.warning("Tavily API key missing. Web search disabled.", icon="⚠️")
+        if not pinecone_api_key:
+             logger.error("Pinecone API key not found in environment. RAG system cannot be initialized.")
+             # Display error and stop execution if Pinecone is essential
+             st.error("Pinecone API key missing. Please set the PINECONE_API_KEY environment variable.", icon="🚨")
+             st.stop() # Stop the app if Pinecone connection fails
+
+        try:
+            # Pass Tavily key; RAGS init handles Pinecone key internally
+            st.session_state.rag_system = RAGS(tavily_api_key=tavily_api_key)
+            logger.info("RAG system initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG system: {e}", exc_info=True)
+            st.error(f"Failed to initialize RAG system: {e}", icon="🚨")
+            st.stop() # Stop if RAGS initialization fails
+
     if "document_sources" not in st.session_state:
-        st.session_state.document_sources = set()
-        
+        st.session_state.document_sources: Set[str] = set() # Use type hint
+
     if "retrieved_documents" not in st.session_state:
-        st.session_state.retrieved_documents = []
+        # This will store the source info dictionaries for the latest query
+        st.session_state.retrieved_documents: List[Dict] = []
 
-def process_and_store_documents(sources: List[str]) -> List[Dict]:
-    """Process documents and store them in the RAG system"""
+def process_and_store_documents(sources: List[str]) -> int:
+    """Process documents and store them in the RAG system. Returns number of chunks processed."""
+    if 'rag_system' not in st.session_state:
+        st.error("RAG system not initialized.")
+        return 0
     try:
-        documents = st.session_state.rag_system.load_content(sources)
-        st.session_state.document_sources.update(sources)
-        return documents
+        # Filter out already processed sources
+        new_sources = [s for s in sources if s not in st.session_state.document_sources]
+        if not new_sources:
+            st.info("All provided sources have already been processed.")
+            return 0
+
+        # Use load_content which returns the processed splits/chunks
+        processed_chunks = st.session_state.rag_system.load_content(new_sources)
+        st.session_state.document_sources.update(new_sources) # Add successfully processed sources
+        logger.info(f"Processed {len(processed_chunks)} chunks from {len(new_sources)} new sources.")
+        return len(processed_chunks)
     except Exception as e:
+        logger.error(f"Error processing documents: {str(e)}", exc_info=True)
         st.error(f"Error processing documents: {str(e)}")
-        return []
+        return 0
 
-def display_sources(sources: List[Dict]):
-    """Display source information in a structured format"""
-    if not sources:
+def display_sources_summary(sources_info: List[Dict]):
+    """Display source information in the chat response expander."""
+    if not sources_info:
+        st.write("No specific sources were cited for this response.")
         return
-        
-    with st.expander("📚 Detailed Source Information", expanded=False):
-        for idx, source in enumerate(sources, 1):
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(f"**Source:** `{source.get('source', 'Unknown')}`")
-                st.markdown(f"**Type:** `{source.get('type', 'unknown').upper()}`")
-            with col2:
-                if isinstance(source.get('relevance'), float):
-                    st.metric("Relevance Score", f"{source['relevance']:.2f}")
-            
-            st.markdown("**Content Preview:**")
-            st.markdown(f'<div class="reference-content">{source.get("content", "No preview available")}</div>', 
-                       unsafe_allow_html=True)
-            st.markdown("---")
 
-def display_retrieved_documents():
-    """Display retrieved documents with their metadata"""
+    for idx, source_data in enumerate(sources_info, 1):
+        source_loc = source_data.get('source', 'Unknown')
+        source_type = source_data.get('type', 'N/A').upper()
+        content_preview = source_data.get('content', 'No preview available.')
+        relevance = source_data.get('relevance', 'N/A') # Might be None or a score
+
+        st.markdown(f"""
+        <div class="reference-container">
+            <div class="reference-header">
+                Source {idx}: {source_loc} <span class="source-citation">{source_type}</span>
+            </div>
+            <div class="reference-content">
+                {content_preview}
+            </div>
+            <div class="reference-metadata">
+                Cited Relevance Score: {relevance if isinstance(relevance, (float, int)) else 'N/A'}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# This function remains largely the same, used for the sidebar potentially
+def display_retrieved_documents_sidebar():
+    """Display retrieved documents with their metadata (e.g., in sidebar or dedicated area)"""
     if not st.session_state.retrieved_documents:
-        return
-        
-    with st.expander("📑 Retrieved Context Chunks (Used for Answer)", expanded=True):
-        for doc in st.session_state.retrieved_documents:
-            source = doc.get('source', 'Unknown Source')
-            doc_type = doc.get('type', 'Unknown').upper()
-            content = doc.get('content', 'No content available')
-            relevance = doc.get('relevance', 'N/A')
+        return # Don't display if empty
+
+    with st.expander("📑 Context Used for Last Answer", expanded=False): # Start collapsed
+        if not st.session_state.retrieved_documents:
+             st.info("No documents were retrieved or processed for the last query.")
+             return
+
+        for idx, doc_info in enumerate(st.session_state.retrieved_documents, 1):
+            source = doc_info.get('source', 'Unknown Source')
+            doc_type = doc_info.get('type', 'Unknown').upper()
+            content = doc_info.get('content', 'No content available')
+            relevance = doc_info.get('relevance', 'N/A')
 
             st.markdown(f"""
             <div class="reference-container">
                 <div class="reference-header">
-                    {source} <span class="source-citation">{doc_type}</span>
+                   Context Chunk {idx}: {source} <span class="source-citation">{doc_type}</span>
                 </div>
                 <div class="reference-content">
                     {content}
                 </div>
                 <div class="reference-metadata">
-                    Relevance Score: {relevance if isinstance(relevance, float) else 'N/A'}
+                    Retrieved Relevance: {relevance if isinstance(relevance, (float, int)) else 'N/A'}
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
 def clear_system():
-    """Clear the RAG system and reset all session state"""
-    try:
-        st.session_state.rag_system.clear_index()
-        st.session_state.document_sources.clear()
+    """Clear the RAG system index and reset session state related to data."""
+    if 'rag_system' not in st.session_state:
+        st.warning("RAG system not initialized, nothing to clear.")
+        # Reset other states anyway
+        st.session_state.document_sources = set()
         st.session_state.retrieved_documents = []
         st.session_state.messages = []
-        st.success("✅ System cleared successfully")
+        return
+
+    try:
+        with st.spinner("Clearing Pinecone index and local data..."):
+            st.session_state.rag_system.clear_index()
+        # Reset session state variables after successful clearing
+        st.session_state.document_sources = set()
+        st.session_state.retrieved_documents = []
+        st.session_state.messages = [] # Clear chat history as well
+        st.success("✅ System index and chat history cleared successfully!")
+        # Force rerun to reflect cleared state, especially messages
+        st.rerun()
     except Exception as e:
+        logger.error(f"Error clearing system: {str(e)}", exc_info=True)
         st.error(f"Error clearing system: {str(e)}")
 
 def main():
@@ -152,95 +227,145 @@ def main():
         page_icon="🤖",
         layout="wide"
     )
-    
+
     load_css()
+    # Initialize state, potentially stopping execution if keys are missing
     initialize_session_state()
-    
+
     st.title("🤖 Advanced RAG System")
     st.markdown("---")
-    
-    # Split the interface into two columns
-    col1, col2 = st.columns([2, 1])
-    
-    with col2:
+
+    # Use sidebar for document management and status
+    with st.sidebar:
         st.markdown("### 📚 Document Management")
-        
+
         urls_input = st.text_area(
-            "Enter URLs or file paths (one per line)",
-            placeholder="https://example.com/doc1\n/path/to/file.pdf",
-            height=100
+            "Enter URLs or local file paths (one per line):",
+            placeholder="https://example.com/doc1\n/path/to/your/file.pdf",
+            height=150, # Increased height
+            key="sources_input_area" # Added key
         )
-        
+
         col_process, col_clear = st.columns(2)
         with col_process:
-            if st.button("🚀 Load Documents"):
-                if urls_input.strip():
-                    sources = [url.strip() for url in urls_input.split('\n') if url.strip()]
-                    with st.spinner("Processing documents..."):
-                        processed_docs = process_and_store_documents(sources)
-                        if processed_docs:
-                            st.success(f"✅ Processed {len(processed_docs)} chunks from {len(sources)} sources")
-                else:
-                    st.warning("Please enter at least one URL or file path")
-                    
-        with col_clear:
-            if st.button("🧹 Clear System"):
-                clear_system()
-        
-        st.markdown("### 📊 System Status")
-        if st.session_state.document_sources:
-            st.write(f"Loaded Sources: {len(st.session_state.document_sources)}")
-            with st.expander("View Source List"):
-                for source in sorted(st.session_state.document_sources):
-                    st.write(f"- `{source}`")
-        else:
-            st.info("No documents loaded yet")
+            if st.button("➕ Load Documents", key="load_docs_button"):
+                if urls_input and urls_input.strip():
+                    # Validate basic format (simple check)
+                    sources = [url.strip() for url in urls_input.split('\n') if url.strip() and (url.startswith('http') or os.path.exists(url.strip()))]
+                    invalid_sources = [url.strip() for url in urls_input.split('\n') if url.strip() and not (url.startswith('http') or os.path.exists(url.strip()))]
 
-    with col1:
-        st.markdown("### 💬 Query Interface")
-        
-        # Display chat history
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"], unsafe_allow_html=True)
-                if message["role"] == "assistant" and "sources" in message:
-                    with st.expander("View Sources for this Response"):
-                        display_sources(message["sources"])
-        
-        # Display retrieved documents
-        display_retrieved_documents()
-        
-        # Query input and processing
-        if query := st.chat_input("Ask a question about your documents..."):
-            st.session_state.messages.append({"role": "user", "content": query})
-            with st.chat_message("user"):
-                st.markdown(query)
-            
+                    if invalid_sources:
+                         st.warning(f"Ignoring invalid or non-existent paths: {', '.join(invalid_sources)}", icon="⚠️")
+
+                    if sources:
+                        with st.spinner("Processing documents... This may take a while."):
+                            num_chunks = process_and_store_documents(sources)
+                            if num_chunks > 0:
+                                st.success(f"✅ Processed {num_chunks} chunks from {len(sources)} new source(s).")
+                            # Message for no new sources is handled inside process_and_store_documents
+                    else:
+                         st.warning("No valid new URLs or existing file paths provided.")
+                else:
+                    st.warning("Please enter at least one URL or file path.")
+
+        with col_clear:
+            # Add confirmation for clearing
+            if st.button("🧹 Clear All Data", key="clear_system_button"):
+                 # Use a flag in session state to manage confirmation dialog
+                 st.session_state.confirm_clear = True
+
+        # Confirmation dialog logic
+        if st.session_state.get('confirm_clear', False):
+            st.warning("**Are you sure you want to clear the index and chat history?** This cannot be undone.")
+            c1, c2 = st.columns(2)
+            if c1.button("Yes, Clear Everything"):
+                clear_system()
+                st.session_state.confirm_clear = False # Reset flag
+                st.rerun() # Rerun to update UI after clear
+            if c2.button("Cancel"):
+                st.session_state.confirm_clear = False # Reset flag
+                st.rerun() # Rerun to hide confirmation
+
+
+        st.markdown("### 📊 System Status")
+        if 'rag_system' in st.session_state:
+            if st.session_state.document_sources:
+                st.write(f"Loaded Sources: {len(st.session_state.document_sources)}")
+                with st.expander("View Loaded Source List"):
+                    # Sort sources for consistent display
+                    for source in sorted(list(st.session_state.document_sources)):
+                        st.markdown(f"- `{source}`")
+            else:
+                st.info("No documents loaded yet.")
+        else:
+             st.error("RAG system not available.")
+
+        # Display retrieved documents from the *last* query in the sidebar
+        display_retrieved_documents_sidebar()
+
+
+    # Main chat interface
+    st.markdown("### 💬 Query Interface")
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"], unsafe_allow_html=True)
+            # Display sources associated with assistant message, if any
+            if message["role"] == "assistant" and "sources" in message and message["sources"]:
+                with st.expander("View Sources Cited in this Response"):
+                    display_sources_summary(message["sources"])
+
+    # Query input and processing
+    if query := st.chat_input("Ask a question about the loaded documents..."):
+        # Append user message immediately
+        st.session_state.messages.append({"role": "user", "content": query})
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        # Process query with RAG system
+        if 'rag_system' not in st.session_state:
+             st.error("Cannot process query: RAG system is not initialized.", icon="🚨")
+        elif not st.session_state.document_sources:
+            st.warning("⚠️ Please load documents using the sidebar before asking questions.", icon="⚠️")
+            # Add placeholder assistant message
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "I need documents to answer questions. Please load some using the 'Load Documents' button in the sidebar."
+            })
+            # Rerun to display the warning message immediately
+            st.rerun()
+        else:
             with st.chat_message("assistant"):
-                if not st.session_state.document_sources:
-                    st.warning("⚠️ Please load documents first!")
-                    return
-                    
-                with st.spinner("🔍 Analyzing documents..."):
+                message_placeholder = st.empty() # Placeholder for streaming or final answer
+                with st.spinner("🧠 Thinking... (Performing retrieval, CRAG, and generation)"):
                     try:
-                        # Get response and sources from RAG system
+                        # Get response and source info dictionaries from RAG system
                         answer, sources = st.session_state.rag_system.query(query)
-                        
-                        # Store retrieved documents for display
+
+                        # Store the source info for the *last* query for sidebar display
                         st.session_state.retrieved_documents = sources
-                        
-                        # Display the response with citations
-                        st.markdown(answer, unsafe_allow_html=True)
-                        
-                        # Store message with sources
+
+                        # Display the final answer
+                        message_placeholder.markdown(answer, unsafe_allow_html=True)
+
+                        # Store assistant message with its specific sources
                         st.session_state.messages.append({
-                            "role": "assistant", 
+                            "role": "assistant",
                             "content": answer,
-                            "sources": sources
+                            "sources": sources # Store the list of source dictionaries
                         })
-                        
+
+                        # Optionally rerun to update the sidebar immediately with new context
+                        # st.rerun()
+
                     except Exception as e:
-                        st.error(f"❌ Error processing query: {str(e)}")
+                        logger.error(f"Error processing query: {str(e)}", exc_info=True)
+                        error_message = f"❌ Error processing query: {str(e)}"
+                        message_placeholder.error(error_message)
+                        st.session_state.messages.append({"role": "assistant", "content": error_message})
+
 
 if __name__ == "__main__":
     main()
