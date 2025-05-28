@@ -1,36 +1,38 @@
-import os
+# Standard library imports
 import getpass
-import time
-import logging # Keep import for logger usage
-from typing import List, Union, Dict, Tuple
-from operator import itemgetter
 import hashlib
 import json
-import sys
+import logging
+import os
 import re
+import sys
+import time
+from operator import itemgetter
+from typing import Dict, List, Tuple, Union
+
+# Third-party imports
 import chardet
-import bs4
 from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
-
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    CSVLoader,
-    WebBaseLoader
-)
-from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.chat_models import ChatOllama
-from langchain_pinecone import PineconeVectorStore
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from pinecone import Pinecone, ServerlessSpec
 from rank_bm25 import BM25Okapi
+
+# LangChain imports - Updated versions
+from langchain_ollama import ChatOllama  # Updated from langchain_community
+from langchain_community.document_loaders import (
+    CSVLoader,
+    PyPDFLoader,
+    WebBaseLoader
+)
 from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.documents import Document
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_huggingface import HuggingFaceEmbeddings  # Updated from langchain_community
+from langchain_pinecone import PineconeVectorStore  # Updated from langchain_community.vectorstores.pinecone
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+# Load environment variables from .env file
+load_dotenv()
 
 # REMOVED logging.basicConfig - Configure logging ONCE in your main entry point (e.g., orchestrator.py)
 logger = logging.getLogger(__name__) # Get logger for use in this module
@@ -184,25 +186,23 @@ class RAGS:
         self.dimension = dimension
         self.relevance_threshold = relevance_threshold
         self.document_loader = DocumentProcessor()
+        self.pinecone_client = None # Initialize pinecone_client attribute
 
         logger.info(f"Initializing RAGS with LLM: {self.llm_model}, Embedding: {self.embedding_model}")
 
         self.setup_pinecone()
 
-        # --- FIX: Removed explicit device setting to avoid meta tensor error ---
         self.embeddings = HuggingFaceEmbeddings(
             model_name=self.embedding_model,
-            # model_kwargs={'device': 'cpu'}, # REMOVED this line
             encode_kwargs={'normalize_embeddings': True}
         )
 
         self.vector_store = PineconeVectorStore(
-            index=self.index,
+            index=self.index, # self.index is set in setup_pinecone
             embedding=self.embeddings,
             text_key='text'
         )
 
-        # --- PARAMETER REDUCTION (Keep k low) ---
         self.retriever = self.vector_store.as_retriever(search_kwargs={'k': 3})
 
         self.bm25_corpus = []
@@ -225,7 +225,6 @@ class RAGS:
 
 
     def setup_pinecone(self):
-        # (Method unchanged)
         pinecone_api_key = os.getenv("PINECONE_API_KEY")
         if not pinecone_api_key:
             try:
@@ -236,24 +235,39 @@ class RAGS:
         if not pinecone_api_key:
              raise ValueError("Pinecone API key is required.")
         try:
-            self.pc = Pinecone(api_key=pinecone_api_key)
-            existing_indexes = [index_info["name"] for index_info in self.pc.list_indexes()]
+            # Initialize Pinecone client
+            self.pinecone_client = Pinecone(api_key=pinecone_api_key)
+            
+            # Check if index 
+            existing_indexes = self.pinecone_client.list_indexes().names()
             if self.index_name not in existing_indexes:
                 logger.info(f"Creating new Pinecone index: {self.index_name}")
-                self.pc.create_index(
-                    name=self.index_name, dimension=self.dimension, metric="cosine",
-                    spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                # Determine spec for index creation
+                # Using ServerlessSpec as per the error message example structure.
+                # User might need to adjust cloud/region or use PodSpec if that was their prior setup.
+                pinecone_cloud = os.getenv("PINECONE_CLOUD", "aws")
+                pinecone_region = os.getenv("PINECONE_REGION", "us-west-2")
+                
+                self.pinecone_client.create_index(
+                    name=self.index_name,
+                    dimension=self.dimension,
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                        cloud=pinecone_cloud,
+                        region=pinecone_region
+                    )
                 )
                 wait_time = 5
-                while not self.pc.describe_index(self.index_name).status["ready"]:
+                while not self.pinecone_client.describe_index(self.index_name).status["ready"]:
                     logger.info(f"Waiting for index '{self.index_name}' to be ready (waiting {wait_time}s)...")
                     time.sleep(wait_time)
             else:
-                 logger.info(f"Using existing Pinecone index: {self.index_name}")
-            self.index = self.pc.Index(self.index_name)
+                logger.info(f"Using existing Pinecone index: {self.index_name}")
+                
+            self.index = self.pinecone_client.Index(self.index_name)
             logger.info(f"Pinecone index stats: {self.index.describe_index_stats()}")
+            
         except Exception as e:
-            # Wrap exception for clearer error reporting during init
             raise RuntimeError(f"Failed to initialize Pinecone: {str(e)}") from e
 
 
@@ -303,9 +317,14 @@ class RAGS:
             return []
         try:
             logger.info(f"Building BM25 index with {len(self.bm25_corpus)} total documents...")
+            # Assuming BM25Okapi is defined elsewhere or imported, as it's not in the provided snippet
+            from rank_bm25 import BM25Okapi # Placeholder, ensure this is correctly imported/defined
             tokenized_corpus = [self.custom_tokenize(text) for text in self.bm25_corpus]
             self.bm25 = BM25Okapi(tokenized_corpus)
             logger.info("BM25 index built successfully.")
+        except ImportError:
+            logger.error("BM25Okapi not found. Please install rank_bm25: pip install rank_bm25")
+            self.bm25 = None
         except Exception as e:
              logger.error(f"Failed to build BM25 index: {e}")
              self.bm25 = None
@@ -394,8 +413,6 @@ Output JSON:\n{{"query": "Your rewritten query goes here"}}"""
         self.prompt_rewrite = ChatPromptTemplate.from_template(query_rewrite_template)
         self.rewrite_query_chain = self.prompt_rewrite | json_llm | StrOutputParser() # Keep StrOutputParser, parsing handled later
 
-        # --- RESTORED Multi-Query Prompt ---
-        # --- PARAMETER REDUCTION: Ask for only 1 extra query ---
         multi_query_generation_template = """Based on the 'Rewritten Query' and 'Document Summary', generate exactly 1 distinct search query exploring a different facet of the topic.
 The query should be specific, academic-focused, and highly relevant to the document's themes.
 Output only a JSON object containing a list of 1 query string.
@@ -407,9 +424,9 @@ Rewritten Query:
 {rewritten_query}
 
 Output JSON:
-{{"queries": ["query1"]}}""" # Modified example output
+{{"queries": ["query1"]}}"""
         self.prompt_multi_query = ChatPromptTemplate.from_template(multi_query_generation_template)
-        self.multi_query_chain = self.prompt_multi_query | json_llm | JsonOutputParser() # Use JsonOutputParser directly
+        self.multi_query_chain = self.prompt_multi_query | json_llm | JsonOutputParser() 
 
         final_template = """You are an AI research assistant. Synthesize the information from the 'Context' documents below to provide a comprehensive, detailed answer to the 'Question'.
 Instructions:\n- Answer the question directly and thoroughly.\n- Integrate information from multiple relevant context documents.\n- Use specific examples or data points from the context.\n- Explain technical terms clearly.\n- Cite sources accurately in-line using the format [Doc X - Type: Source Name]. Example: [Doc 1 - Web: lilianweng.github.io/...] or [Doc 3 - File: my_paper.pdf].\n- Structure the answer logically in Markdown format.\n
@@ -428,12 +445,10 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         )
 
     def generate_queries(self, input_dict: dict) -> List[str]:
-        # --- RESTORED Multi-Query Logic (Simplified) ---
         question = input_dict["question"]
         logger.info(f"Generating queries for original question: {question}")
-        generated_queries = [] # Initialize
+        generated_queries = [] 
         try:
-            # Retrieve context (unchanged)
             context_query = f"General information related to: {question}"
             retrieved_docs = self.hybrid_retrieve_for_query(context_query, top_k=1)
             if not retrieved_docs:
@@ -444,7 +459,6 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
             document_summary = self.document_summary_chain.invoke({"document_chunk": first_document_split})
             logger.info(f"Document Summary for query generation: {document_summary}")
 
-            # Get query intent (unchanged)
             try:
                 query_intent_result = self.query_intent_chain.invoke({"document_chunk": first_document_split, "question": question})
                 logger.info(f"Query Intent Analysis: {query_intent_result}")
@@ -453,7 +467,6 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                 logger.error(f"Error getting query intent: {e}. Proceeding without intent analysis.")
                 query_intent_str = "{}"
 
-            # Rewrite query (unchanged)
             try:
                 rewritten_query_output = self.rewrite_query_chain.invoke({"question": question, "document_summary": document_summary, "query_intent": query_intent_str})
                 rewritten_query = parse_rewritten_query(rewritten_query_output)
@@ -462,13 +475,11 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                 logger.error(f"Error rewriting query: {e}. Using original query.")
                 rewritten_query = question
 
-            # --- RESTORED: Generate 1 additional query ---
             try:
                 multi_query_result = self.multi_query_chain.invoke({
                      "rewritten_query": rewritten_query,
                      "document_summary": document_summary
                 })
-                # The parser expects 'queries' key, result should be {"queries": ["query1"]}
                 if isinstance(multi_query_result, dict) and "queries" in multi_query_result and isinstance(multi_query_result["queries"], list):
                      generated_queries = multi_query_result["queries"]
                      logger.info(f"Generated {len(generated_queries)} additional query/queries: {generated_queries}")
@@ -478,24 +489,22 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
 
             except Exception as e:
                 logger.error(f"Error generating multiple queries: {e}. Skipping additional query generation.")
-                generated_queries = [] # Ensure it's an empty list on error
+                generated_queries = [] 
 
 
-            # Combine and deduplicate queries (Original + Rewritten + Generated[0] if exists)
             final_queries = [question, rewritten_query]
             if generated_queries:
-                final_queries.append(generated_queries[0]) # Add the first (and only expected) generated query
+                final_queries.append(generated_queries[0]) 
 
             seen = set()
             unique_queries = [q for q in final_queries if q and not (q in seen or seen.add(q))]
             logger.info(f"Final Unique Queries for Retrieval: {unique_queries}")
 
-            # Return max 3 queries (Original, Rewritten, 1 Generated)
             return unique_queries[:3]
 
         except Exception as e:
             logger.error(f"Error in query generation pipeline: {str(e)}")
-            return [question] # Fallback to original question
+            return [question] 
 
     def format_docs(self, docs: List[Document]) -> str:
         # (Method unchanged)
@@ -520,8 +529,6 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
 
 
     def bm25_retrieve(self, query: str, top_k: int = 5) -> List[Document]:
-        # --- PARAMETER REDUCTION (Keep k low) ---
-        # Default stays 5, but it's called with 5 below.
         if not self.bm25 or not self.bm25_corpus:
             logger.warning("BM25 index not available.")
             return []
@@ -589,25 +596,22 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         return fused_docs
 
     def hybrid_retrieve_for_query(self, query: str, top_k=3) -> List[Document]:
-        # --- PARAMETER REDUCTION (Keep k low) ---
         logger.info(f"Starting hybrid retrieval for query: '{query}' (target top_k={top_k})")
         try:
-            # Retriever already limited to k=3 in init
             pinecone_results = self.retriever.invoke(query)
             logger.info(f"Pinecone retrieved {len(pinecone_results)} documents")
         except Exception as e:
             logger.error(f"Pinecone retrieval error: {e}")
             pinecone_results = []
 
-        # --- PARAMETER REDUCTION (Keep k low) ---
-        bm25_results = self.bm25_retrieve(query, top_k=5) # Retrieve 5 for BM25 pool
+        bm25_results = self.bm25_retrieve(query, top_k=5) 
 
         if not pinecone_results and not bm25_results:
             logger.warning("No results from either Pinecone or BM25 retrieval.")
             return []
 
         fused_results = self.reciprocal_rank_fusion_direct(pinecone_results, bm25_results)
-        final_results = fused_results[:top_k] # Apply the target top_k (3)
+        final_results = fused_results[:top_k] 
         logger.info(f"Hybrid retrieval returning {len(final_results)} fused documents for query '{query}'")
         return final_results
 
@@ -656,14 +660,12 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
             return 0.0, "Evaluation error."
 
     def process_with_crag(self, question: str, documents: List[Document]) -> List[Document]:
-        # --- PARAMETER REDUCTION (Keep limits low) ---
         logger.info(f"Starting CRAG processing for {len(documents)} retrieved documents.")
         processed_docs_content = {}
         original_doc_metadata = {}
         all_processed_strips = []
         need_web_search = True
 
-        # Check top 3 initial docs
         for doc in documents[:3]:
             doc_score, doc_just = self.evaluate_document_relevance(question, doc)
             source = doc.metadata.get('source', 'Unknown')
@@ -673,7 +675,6 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                 need_web_search = False
                 strips = self.create_knowledge_strips(question, doc)
                 relevant_strips_for_doc = []
-                # Process top 5 strips per doc
                 for strip in strips[:5]:
                     strip_score, strip_just = self.evaluate_strip_relevance(question, strip)
                     if strip_score >= self.relevance_threshold:
@@ -691,12 +692,10 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         if need_web_search and self.web_search:
              logger.info("Performing web search as initial documents were not relevant enough.")
              web_docs = self.web_search_documents(question)
-             # Process top 2 web results
              for doc in web_docs[:2]:
                  source = doc.metadata.get('source', 'Web Result')
                  strips = self.create_knowledge_strips(question, doc)
                  relevant_strips_for_doc = []
-                 # Process top 5 strips per web doc
                  for strip in strips[:5]:
                      strip_score, strip_just = self.evaluate_strip_relevance(question, strip)
                      if strip_score >= self.relevance_threshold:
@@ -721,7 +720,6 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
 
         if not final_docs:
              logger.warning("CRAG processing (including web search) produced no relevant strips. Falling back to top raw retrieved documents.")
-             # Fallback to top 2 raw docs
              final_docs = documents[:2]
              for doc in final_docs:
                  doc.metadata["processed_by_crag"] = False
@@ -733,20 +731,17 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         start_time = time.time()
         logger.info(f"Received query: {question}")
         try:
-            # 1. Generate queries (now includes multi-query again, limited to ~3 total)
             gen_start_time = time.time()
-            queries = self.generate_queries({"question": question}) # Will generate max 3 queries
+            queries = self.generate_queries({"question": question}) 
             logger.info(f"Query generation took {time.time() - gen_start_time:.2f} seconds.")
             if not queries:
                 logger.error("Query generation failed. Aborting.")
                 return "Error: Could not generate search queries.", []
 
-            # 2. Retrieve documents (loop runs max 3 times)
             retrieval_start_time = time.time()
             all_retrieved_docs = []
             unique_doc_hashes = set()
-            for q in queries: # Loop <= 3 times
-                # Retrieve top 3 per query
+            for q in queries: 
                 docs = self.hybrid_retrieve_for_query(q, top_k=3)
                 for doc in docs:
                      doc_hash = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
@@ -766,7 +761,6 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                      all_retrieved_docs = web_fallback_docs[:3]
 
 
-            # 3. Process with CRAG (limits remain reduced)
             crag_start_time = time.time()
             processed_docs = self.process_with_crag(question, all_retrieved_docs)
             logger.info(f"CRAG processing took {time.time() - crag_start_time:.2f} seconds.")
@@ -775,10 +769,8 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                 logger.error("CRAG processing failed to produce any relevant documents.")
                 return "Could not find relevant information after relevance checking and processing.", []
 
-            # 4. Extract sources (unchanged)
             sources_for_display = self.extract_sources_from_docs(processed_docs)
 
-            # 5. Generate final answer (unchanged)
             final_answer_start_time = time.time()
             logger.info("Generating final answer...")
             final_answer = self.final_rag_chain.invoke({
@@ -799,28 +791,25 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
     def clear_index(self):
         # (Method unchanged)
         logger.warning(f"Attempting to clear all data from Pinecone index '{self.index_name}' and reset local state.")
+        if not self.pinecone_client or not self.index:
+            logger.error("Pinecone client or index not initialized. Cannot clear.")
+            raise Exception("Pinecone client/index not initialized.")
         try:
             logger.info(f"Deleting vectors from Pinecone index: {self.index_name}")
-            self.index.delete(delete_all=True)
+            self.index.delete(delete_all=True) # This uses the targeted index object
             self.bm25_corpus = []
             self.bm25_index_map = {}
             self.bm25 = None
             logger.info("Local BM25 data cleared.")
-            time.sleep(2)
-            logger.info(f"Pinecone index '{self.index_name}' cleared successfully.")
+            time.sleep(2) # Allow time for deletion to propagate
+            logger.info(f"Pinecone index '{self.index_name}' cleared successfully (all vectors deleted).")
             return True
         except Exception as e:
             logger.error(f"Error clearing Pinecone index '{self.index_name}': {str(e)}")
             raise Exception(f"Failed to clear index '{self.index_name}': {str(e)}")
 
-# Keep the main function definition, but ensure it's only called when script is run directly
 def main():
-    # This block should only run if you execute this file directly,
-    # not when imported by Streamlit (unless Streamlit also runs it directly somehow).
     try:
-        # Ensure logging is configured *before* RAGS is initialized
-        # If you configure logging in orchestrator.py, this basicConfig might be redundant
-        # or cause issues if called twice. Consider removing it if orchestrator.py handles it.
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -828,24 +817,28 @@ def main():
         )
 
         tavily_key = os.getenv("TAVILY_API_KEY")
-        pinecone_key = os.getenv("PINECONE_API_KEY") # Pinecone key check is implicit in setup_pinecone
-
-        # Note: RAGS initialization might happen twice if Streamlit also imports and creates an instance.
-        print("Initializing RAG system (from main)...") # Added identifier
+        
+        print("Initializing RAG system (from main)...") 
         rag_system = RAGS(tavily_api_key=tavily_key)
 
-        # sources_to_load = ["https://lilianweng.github.io/posts/2024-11-28-reward-hacking/"]
-        # Use a different source for testing variety if needed
         sources_to_load = ["https://lilianweng.github.io/posts/2023-06-23-agent/"]
 
         if sources_to_load:
+            # Added a check for BM25Okapi and rank_bm25 import in load_content
+            # For main to run, ensure rank_bm25 is installed if BM25 is used.
+            try:
+                from rank_bm25 import BM25Okapi # Ensure BM25 is available for local test
+            except ImportError:
+                print("Warning: rank_bm25 not installed. BM25 retrieval will be skipped if documents are loaded.")
+                print("Please install with: pip install rank_bm25")
+
+
             print(f"Loading content from: {sources_to_load}")
             documents = rag_system.load_content(sources_to_load)
             print(f"Loaded {len(documents)} document chunks.")
         else:
              print("No sources provided to load. Querying existing index (if any).")
 
-        # question = "define reward hacking"
         question = "Explain task decomposition in autonomous agents based on the provided context."
         print(f"\nQuerying with: '{question}'")
 
@@ -862,10 +855,8 @@ def main():
 
     except Exception as e:
          print(f"\nAn error occurred during the main execution: {e}")
-         # Use logger for traceback if logging is configured
          logger.exception("Main execution failed.")
 
 
-# Ensure main() only runs when this script is executed directly
 if __name__ == "__main__":
     main()
