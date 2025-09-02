@@ -1,0 +1,28 @@
+[project]
+name = "fromrag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.13.5",
+    "chardet>=5.2.0",
+    "huggingface-hub>=0.34.4",
+    "langchain>=0.3.27",
+    "langchain-community>=0.3.21",
+    "langchain-core>=0.3.75",
+    "langchain-huggingface>=0.3.1",
+    "langchain-ollama>=0.3.7",
+    "langchain-pinecone>=0.2.12",
+    "langchain-text-splitters>=0.3.11",
+    "numpy<2",
+    "pandas>=2.3.2",
+    "pinecone-client>=6.0.0",
+    "python-dotenv>=1.1.1",
+    "rank-bm25>=0.2.2",
+    "scikit-learn>=1.7.1",
+    "sentence-transformers>=5.1.0",
+    "streamlit>=1.49.1",
+    "torch>=2.8.0",
+    "transformers>=4.56.0",
+]

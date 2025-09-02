@@ -9,7 +9,6 @@ import sys
 import time
 from operator import itemgetter
 from typing import Dict, List, Tuple, Union
-from concurrent.futures import ThreadPoolExecutor # Added for parallelism
 import threading # Added for Lock, if necessary
 
 # Third-party imports
@@ -55,7 +54,7 @@ CRAG_STRIP_CONTENT_PREVIEW_LEN = 500
 
 JSON_LLM_TEMPERATURE = 0.0
 GENERAL_LLM_TEMPERATURE = 0.1
-MAX_WORKERS_DEFAULT = 5 # Default max workers for ThreadPoolExecutor
+# Removed ThreadPoolExecutor - using sequential processing
 
 def parse_rewritten_query(raw_output: str) -> str:
     logger.info(f"Raw rewritten query output: {raw_output}")
@@ -220,8 +219,7 @@ class RAGS:
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
         relevance_threshold: float = 0.3,
-        tavily_api_key: str = None,
-        max_workers: int = MAX_WORKERS_DEFAULT
+        tavily_api_key: str = None
     ):
         self.index_name = index_name
         self.embedding_model_name = embedding_model # Store name for clarity
@@ -230,7 +228,6 @@ class RAGS:
         self.relevance_threshold = relevance_threshold
         self.document_loader = DocumentProcessor()
         self.pinecone_client = None
-        self.max_workers = max_workers
 
         # Configure LLM Caching
         set_llm_cache(InMemoryCache())
@@ -358,17 +355,16 @@ class RAGS:
         all_valid_splits = []
         all_bm25_data = []
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(self._process_single_source, source) for source in sources]
-            for future in futures:
-                try:
-                    splits, bm25_source_data = future.result()
-                    if splits:
-                        all_valid_splits.extend(splits)
-                    if bm25_source_data:
-                        all_bm25_data.extend(bm25_source_data)
-                except Exception as e:
-                    logger.error(f"A source processing task failed: {e}")
+        # Process sources sequentially
+        for source in sources:
+            try:
+                splits, bm25_source_data = self._process_single_source(source)
+                if splits:
+                    all_valid_splits.extend(splits)
+                if bm25_source_data:
+                    all_bm25_data.extend(bm25_source_data)
+            except Exception as e:
+                logger.error(f"Source processing failed for {source}: {e}")
         
         if not all_valid_splits:
             logger.warning("No documents were successfully processed from any source.")
@@ -868,17 +864,15 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         if not docs_to_process:
             return []
 
-        # 1. Batch evaluate document relevance
-        doc_eval_inputs = [
-            {"question": question, "document": doc.page_content[:CRAG_DOC_CONTENT_PREVIEW_LEN]}
-            for doc in docs_to_process
-        ]
-        try:
-            doc_eval_results = self.relevance_chain.batch(doc_eval_inputs, config={"max_concurrency": self.max_workers})
-        except Exception as e:
-            logger.error(f"Batch document relevance evaluation failed: {e}")
-            # Fallback to sequential if batch fails (or handle error appropriately)
-            doc_eval_results = [self.evaluate_document_relevance(question, doc)[0] for doc in docs_to_process] # Simpler fallback: just scores
+        # 1. Sequential document relevance evaluation
+        doc_eval_results = []
+        for doc in docs_to_process:
+            try:
+                score, justification = self.evaluate_document_relevance(question, doc)
+                doc_eval_results.append({"score": score, "justification": justification})
+            except Exception as e:
+                logger.error(f"Document relevance evaluation failed for doc: {e}")
+                doc_eval_results.append({"score": 0.0, "justification": "Error during evaluation"})
 
         relevant_docs_for_stripping = []
         for i, doc in enumerate(docs_to_process):
@@ -895,17 +889,15 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         if not relevant_docs_for_stripping:
             return []
 
-        # 2. Batch create knowledge strips for relevant documents
-        strip_creation_inputs = [
-            {"question": question, "document": doc.page_content[:CRAG_STRIP_CREATION_DOC_PREVIEW_LEN]}
-            for doc in relevant_docs_for_stripping
-        ]
-        try:
-            # strip_chain is StrOutputParser, results are strings
-            strip_creation_raw_outputs = self.strip_chain.batch(strip_creation_inputs, config={"max_concurrency": self.max_workers})
-        except Exception as e:
-            logger.error(f"Batch strip creation failed: {e}")
-            return [] # Cannot proceed without strips
+        # 2. Sequential knowledge strip creation for relevant documents
+        strip_creation_raw_outputs = []
+        for doc in relevant_docs_for_stripping:
+            try:
+                raw_output = self.strip_chain.invoke({"question": question, "document": doc.page_content[:CRAG_STRIP_CREATION_DOC_PREVIEW_LEN]})
+                strip_creation_raw_outputs.append(raw_output)
+            except Exception as e:
+                logger.error(f"Strip creation failed for doc: {e}")
+                strip_creation_raw_outputs.append("No relevant strips found.")
 
         all_strips_to_evaluate_relevance = []
         for doc, raw_strips_string in zip(relevant_docs_for_stripping, strip_creation_raw_outputs):
@@ -927,17 +919,15 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
         if not all_strips_to_evaluate_relevance:
             return []
 
-        # 3. Batch evaluate strip relevance
-        strip_relevance_inputs = [
-            {"question": question, "strip": s_info["text"][:CRAG_STRIP_CONTENT_PREVIEW_LEN]}
-            for s_info in all_strips_to_evaluate_relevance
-        ]
-        try:
-            # strip_relevance_chain is JsonOutputParser, results are dicts
-            strip_relevance_results = self.strip_relevance_chain.batch(strip_relevance_inputs, config={"max_concurrency": self.max_workers})
-        except Exception as e:
-            logger.error(f"Batch strip relevance evaluation failed: {e}")
-            return [] # Cannot score strips
+        # 3. Sequential strip relevance evaluation
+        strip_relevance_results = []
+        for s_info in all_strips_to_evaluate_relevance:
+            try:
+                score, justification = self.evaluate_strip_relevance(question, s_info["text"])
+                strip_relevance_results.append({"score": score, "justification": justification})
+            except Exception as e:
+                logger.error(f"Strip relevance evaluation failed: {e}")
+                strip_relevance_results.append({"score": 0.0, "justification": "Error during evaluation"})
 
         for i, s_info in enumerate(all_strips_to_evaluate_relevance):
             score = strip_relevance_results[i].get("score", 0.0) if isinstance(strip_relevance_results[i], dict) else 0.0
@@ -1054,20 +1044,13 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                 return "Error: Could not generate effective search queries for your question.", []
 
             retrieval_start_time = time.time()
-            all_retrieved_docs_futures = []
-            # Parallelize retrieval for each generated query
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                for q_idx, q_text in enumerate(queries_for_retrieval):
-                    logger.info(f"Submitting retrieval task for query {q_idx+1}/{len(queries_for_retrieval)}: '{q_text}'")
-                    # hybrid_retrieve_for_query default top_k is HYBRID_FINAL_K (e.g., 3)
-                    future = executor.submit(self.hybrid_retrieve_for_query, q_text, top_k=HYBRID_FINAL_K)
-                    all_retrieved_docs_futures.append(future)
-            
-            # Collect results and deduplicate
+            # Process retrieval queries sequentially
             unique_docs_map = {} # content_hash -> Document
-            for future in all_retrieved_docs_futures:
+            for q_idx, q_text in enumerate(queries_for_retrieval):
+                logger.info(f"Processing retrieval for query {q_idx+1}/{len(queries_for_retrieval)}: '{q_text}'")
                 try:
-                    docs_from_query = future.result()
+                    # hybrid_retrieve_for_query default top_k is HYBRID_FINAL_K (e.g., 3)
+                    docs_from_query = self.hybrid_retrieve_for_query(q_text, top_k=HYBRID_FINAL_K)
                     for doc in docs_from_query:
                         doc_hash = hashlib.md5(doc.page_content.encode('utf-8')).hexdigest()
                         if doc_hash not in unique_docs_map:
@@ -1077,7 +1060,7 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
                             # For now, keep first encountered.
                             pass 
                 except Exception as e:
-                    logger.error(f"A retrieval task failed: {e}")
+                    logger.error(f"Retrieval failed for query '{q_text}': {e}")
             
             initial_retrieved_docs = list(unique_docs_map.values())
             # Sort by fusion_score if available, to process most relevant first in CRAG
@@ -1173,8 +1156,7 @@ def main():
         tavily_key = os.getenv("TAVILY_API_KEY")
         
         print("Initializing RAG system (from main)...") 
-        # Can pass max_workers here if different from default
-        rag_system = RAGS(tavily_api_key=tavily_key, max_workers=os.cpu_count() or MAX_WORKERS_DEFAULT)
+        rag_system = RAGS(tavily_api_key=tavily_key)
 
 
         # Example: Clear index before loading if starting fresh
