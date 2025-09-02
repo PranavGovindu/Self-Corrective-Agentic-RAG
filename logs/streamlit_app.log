@@ -1,0 +1,89 @@
+2025-09-02 19:18:44 | INFO     | __main__:initialize_session_state - Attempting to initialize RAG system...
+2025-09-02 19:18:44 | INFO     | vector:__init__ - In-memory LLM cache enabled.
+2025-09-02 19:18:44 | INFO     | vector:__init__ - Initializing RAGS with LLM: qwen2.5-coder:1.5b, Embedding: BAAI/bge-m3
+2025-09-02 19:18:46 | INFO     | vector:setup_pinecone - Using existing Pinecone index: rag
+2025-09-02 19:18:48 | INFO     | vector:setup_pinecone - Pinecone index stats: {'dimension': 1024,
+ 'index_fullness': 0.0,
+ 'metric': 'cosine',
+ 'namespaces': {'': {'vector_count': 15}},
+ 'total_vector_count': 15,
+ 'vector_type': 'dense'}
+2025-09-02 19:19:04 | INFO     | vector:__init__ - RAGS initialization complete.
+2025-09-02 19:19:04 | INFO     | __main__:initialize_session_state - RAG system initialized successfully.
+2025-09-02 19:19:14 | WARNING  | vector:clear_index - Attempting to clear all data from Pinecone index 'rag' and reset local BM25 state.
+2025-09-02 19:19:14 | INFO     | vector:clear_index - Deleting all vectors from Pinecone index: rag
+2025-09-02 19:19:15 | INFO     | vector:clear_index - Local BM25 data (corpus, index_map, index) cleared.
+2025-09-02 19:19:20 | INFO     | vector:clear_index - Pinecone index 'rag' stats after delete_all: {'dimension': 1024,
+ 'index_fullness': 0.0,
+ 'metric': 'cosine',
+ 'namespaces': {},
+ 'total_vector_count': 0,
+ 'vector_type': 'dense'}
+2025-09-02 19:19:20 | INFO     | vector:clear_index - Pinecone index 'rag' successfully cleared (0 vectors).
+2025-09-02 19:19:25 | INFO     | __main__:process_and_store_documents - Loading content for sources: ['https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/']
+2025-09-02 19:19:25 | INFO     | vector:_process_single_source - Starting to process source: https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/
+2025-09-02 19:19:26 | INFO     | vector:_process_single_source - Loaded 1 raw documents from https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/
+2025-09-02 19:19:26 | INFO     | vector:_process_single_source - Created 15 splits from https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/
+2025-09-02 19:19:26 | INFO     | vector:_process_single_source - Keeping 15 non-empty splits (min length 50)
+2025-09-02 19:19:38 | INFO     | __main__:initialize_session_state - Attempting to initialize RAG system...
+2025-09-02 19:19:38 | INFO     | vector:__init__ - In-memory LLM cache enabled.
+2025-09-02 19:19:38 | INFO     | vector:__init__ - Initializing RAGS with LLM: qwen2.5-coder:1.5b, Embedding: BAAI/bge-m3
+2025-09-02 19:19:39 | INFO     | vector:load_content - Added 15 documents to vector store from all processed sources.
+2025-09-02 19:19:39 | INFO     | vector:load_content - Building BM25 index with 15 total documents...
+2025-09-02 19:19:39 | INFO     | vector:load_content - BM25 index built successfully.
+2025-09-02 19:19:39 | INFO     | __main__:process_and_store_documents - Processed 15 chunks from 1 new sources.
+2025-09-02 19:19:40 | INFO     | vector:setup_pinecone - Using existing Pinecone index: rag
+2025-09-02 19:19:41 | INFO     | vector:setup_pinecone - Pinecone index stats: {'dimension': 1024,
+ 'index_fullness': 0.0,
+ 'metric': 'cosine',
+ 'namespaces': {},
+ 'total_vector_count': 0,
+ 'vector_type': 'dense'}
+2025-09-02 19:19:47 | INFO     | vector:__init__ - RAGS initialization complete.
+2025-09-02 19:19:47 | INFO     | __main__:initialize_session_state - RAG system initialized successfully.
+2025-09-02 19:20:04 | INFO     | vector:query - Received query: can u tell which is best sleep tracker
+2025-09-02 19:20:04 | INFO     | vector:generate_queries - Generating queries for original question: can u tell which is best sleep tracker
+2025-09-02 19:20:04 | INFO     | vector:hybrid_retrieve_for_query - Starting hybrid retrieval for query: 'General information related to: can u tell which is best sleep tracker' (target final top_k=1)
+2025-09-02 19:20:04 | INFO     | vector:hybrid_retrieve_for_query - Pinecone retrieved 10 documents
+2025-09-02 19:20:04 | INFO     | vector:bm25_retrieve - BM25 retrieved 10 documents for query 'General information related to: can u tell which is best sleep tracker'
+2025-09-02 19:20:04 | INFO     | vector:reciprocal_rank_fusion_direct - RRF Fusion: Input lists count = 2. Total unique docs considered = 11. Output fused docs = 11
+2025-09-02 19:20:04 | INFO     | vector:hybrid_retrieve_for_query - Hybrid retrieval returning 1 fused documents for query 'General information related to: can u tell which is best sleep tracker'
+2025-09-02 19:20:14 | INFO     | vector:generate_queries - Document Summary for query generation: The document discusses 4 sleep tracking apps available for Apple Watch, including Whoop and Oura. Whoop offers a "grand overview" summary page with dense information, while Oura is less dense but requires more movement to find specific details. AutoSleep looks cool but has incorrect numbers, making it unreliable. The document advises getting Whoop for 9.5/10 reliability and convenience, and Oura for 10/10 tracking if you're comfortable with the ring form factor.
+2025-09-02 19:20:21 | INFO     | vector:generate_queries - Query Intent Analysis: {'intent': 'Recommendation', 'search_terms': ['sleep tracker', 'best sleep tracker', 'comparison of sleep trackers'], 'expanded_query': "Can you recommend the best sleep tracker based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns."}
+2025-09-02 19:20:27 | INFO     | vector:parse_rewritten_query - Raw rewritten query output: {
+  "query": "Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns."
+}
+2025-09-02 19:20:27 | INFO     | vector:generate_queries - Rewritten Query: Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.
+2025-09-02 19:20:30 | INFO     | vector:generate_queries - Generated 2 additional query/queries: ['Whoop', 'Oura']
+2025-09-02 19:20:30 | INFO     | vector:generate_queries - Final Unique Queries for Retrieval: ['can u tell which is best sleep tracker', "Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.", 'Whoop', 'Oura']
+2025-09-02 19:20:30 | INFO     | vector:query - Query generation took 26.64 seconds. Generated queries: ['can u tell which is best sleep tracker', "Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.", 'Whoop']
+2025-09-02 19:20:30 | INFO     | vector:query - Processing retrieval for query 1/3: 'can u tell which is best sleep tracker'
+2025-09-02 19:20:30 | INFO     | vector:hybrid_retrieve_for_query - Starting hybrid retrieval for query: 'can u tell which is best sleep tracker' (target final top_k=3)
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Pinecone retrieved 10 documents
+2025-09-02 19:20:31 | INFO     | vector:bm25_retrieve - BM25 retrieved 10 documents for query 'can u tell which is best sleep tracker'
+2025-09-02 19:20:31 | INFO     | vector:reciprocal_rank_fusion_direct - RRF Fusion: Input lists count = 2. Total unique docs considered = 11. Output fused docs = 11
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Hybrid retrieval returning 3 fused documents for query 'can u tell which is best sleep tracker'
+2025-09-02 19:20:31 | INFO     | vector:query - Processing retrieval for query 2/3: 'Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.'
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Starting hybrid retrieval for query: 'Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.' (target final top_k=3)
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Pinecone retrieved 10 documents
+2025-09-02 19:20:31 | INFO     | vector:bm25_retrieve - BM25 retrieved 10 documents for query 'Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.'
+2025-09-02 19:20:31 | INFO     | vector:reciprocal_rank_fusion_direct - RRF Fusion: Input lists count = 2. Total unique docs considered = 12. Output fused docs = 12
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Hybrid retrieval returning 3 fused documents for query 'Which sleep tracker do you recommend based on your needs and preferences? I'm looking for a reliable, convenient app that provides an excellent overview of my sleep patterns.'
+2025-09-02 19:20:31 | INFO     | vector:query - Processing retrieval for query 3/3: 'Whoop'
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Starting hybrid retrieval for query: 'Whoop' (target final top_k=3)
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Pinecone retrieved 10 documents
+2025-09-02 19:20:31 | INFO     | vector:bm25_retrieve - BM25 retrieved 10 documents for query 'Whoop'
+2025-09-02 19:20:31 | INFO     | vector:reciprocal_rank_fusion_direct - RRF Fusion: Input lists count = 2. Total unique docs considered = 10. Output fused docs = 10
+2025-09-02 19:20:31 | INFO     | vector:hybrid_retrieve_for_query - Hybrid retrieval returning 3 fused documents for query 'Whoop'
+2025-09-02 19:20:31 | INFO     | vector:query - Total unique documents initially retrieved across all queries: 6
+2025-09-02 19:20:31 | INFO     | vector:query - Parallel retrieval loop took 1.08 seconds.
+2025-09-02 19:20:31 | INFO     | vector:process_with_crag - Starting CRAG processing for 6 retrieved documents.
+2025-09-02 19:20:50 | INFO     | vector:_process_crag_batch - CRAG Doc 'https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/' relevance: 0.80. Justification: The document excerpt provides information about how to choose a sleep tracker, including whoop, Oura, and the new 8Sleep Pod 4 Ultra. It also mentions that the best choice depends on personal preferences and budget. The excerpt is relevant to the question of which is the best sleep tracker.
+2025-09-02 19:20:50 | INFO     | vector:_process_crag_batch - CRAG Doc 'https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/' relevance: 0.60. Justification: The document excerpt discusses the correlation between different sleep trackers, including Whoop and Oura, and provides data on their performance in terms of heart rate and HRV. It also mentions that AutoSleep has a high correlation with Whoop, which is considered good by the author.
+2025-09-02 19:20:50 | INFO     | vector:_process_crag_batch - CRAG Doc 'https://karpathy.bearblog.dev/finding-the-best-sleep-tracker/' relevance: 0.80. Justification: The document excerpt discusses sleep trackers and provides information on how to find the best one, which aligns with the question about finding the best sleep tracker.
+2025-09-02 19:21:16 | INFO     | vector:process_with_crag - CRAG assembled 1 documents from processed strips.
+2025-09-02 19:21:16 | INFO     | vector:query - CRAG processing took 44.86 seconds.
+2025-09-02 19:21:16 | INFO     | vector:query - Generating final answer with 1 CRAG-processed documents...
+2025-09-02 19:21:34 | INFO     | vector:query - Final answer generation took 17.60 seconds.
+2025-09-02 19:21:34 | INFO     | vector:query - Total query processing time: 90.18 seconds.
+2025-09-02 19:21:34 | INFO     | __main__:main - Query 'can u tell which is best sleep tracker' processed. Answer received. Sources returned: 1

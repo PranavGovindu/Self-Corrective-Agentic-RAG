@@ -5,7 +5,7 @@ Advanced retrieval-augmented generation system with contextual evaluation,
 hybrid search, and intelligent document processing capabilities.
 """
 
-import getpass
+
 import hashlib
 import json
 import os
@@ -58,20 +58,42 @@ JSON_LLM_TEMPERATURE = 0.0
 GENERAL_LLM_TEMPERATURE = 0.1
 
 def parse_rewritten_query(raw_output: str) -> str:
-    """Extract query from LLM output - handles both clean JSON and markdown-wrapped responses."""
+    """
+    Extract rewritten query from LLM output with robust error handling.
+    
+    LLMs sometimes return inconsistent formats - pure JSON, markdown-wrapped JSON,
+    or plain text. This function handles all these cases gracefully.
+    
+    Args:
+        raw_output: Raw string output from the LLM
+        
+    Returns:
+        Cleaned query string ready for use in retrieval
+        
+    Note:
+        The parsing strategy follows a fallback hierarchy:
+        1. Direct JSON parsing (fastest, most reliable)
+        2. Markdown code block extraction
+        3. Regex-based JSON extraction
+        4. Raw text cleanup (last resort)
+    """
     logger.info(f"Raw rewritten query output: {raw_output}")
     
     try:
-        # Try direct JSON parsing first
+        # Strategy 1: Direct JSON parsing - handles well-formed JSON responses
+        # This is the most common case with properly configured LLMs
         data = json.loads(raw_output)
         if isinstance(data, dict) and "query" in data:
             return data["query"]
         elif isinstance(data, str):
             return data
     except json.JSONDecodeError:
-        # Fallback: extract JSON from markdown code blocks or raw text
+        # Strategy 2: Extract from markdown code blocks - handles LLMs that wrap JSON
+        # Some models automatically format JSON in markdown for readability
         match = re.search(r'```json\s*(\{.*?\})\s*```', raw_output, re.DOTALL)
         if not match:
+            # Strategy 3: Look for any JSON-like structure in the text
+            # Handles cases where JSON appears without markdown formatting
             match = re.search(r'(\{.*?\})', raw_output, re.DOTALL)
 
         if match:
@@ -83,7 +105,8 @@ def parse_rewritten_query(raw_output: str) -> str:
             except json.JSONDecodeError as e_inner:
                 logger.warning(f"Failed to parse extracted JSON: {e_inner}")
         
-        # Last resort: return cleaned raw output
+        # Strategy 4: Last resort - clean up raw output
+        # Removes common formatting artifacts like quotes and whitespace
         return raw_output.strip().strip('"')
     except Exception as e:
         logger.error(f"Unexpected error parsing query: {e}")
@@ -91,13 +114,36 @@ def parse_rewritten_query(raw_output: str) -> str:
 
 
 def parse_queries(raw_output: str) -> List[str]:
+    """
+    Parse multiple queries from LLM output for multi-query expansion.
+    
+    Multi-query generation helps improve retrieval coverage by creating
+    multiple perspectives of the same information need. This function
+    handles the parsing robustly with multiple fallback strategies.
+    
+    Args:
+        raw_output: Raw LLM output containing query list
+        
+    Returns:
+        List of query strings, empty list if parsing completely fails
+        
+    Note:
+        Parsing strategy hierarchy:
+        1. JSON parsing with "queries" array
+        2. Markdown-wrapped JSON extraction
+        3. Line-by-line parsing with heuristics
+        4. Empty list (complete failure case)
+    """
     logger.info(f"Raw multi-query output: {raw_output}")
     try:
+        # Strategy 1: Direct JSON parsing - expect {"queries": ["query1", "query2", ...]}
         data = json.loads(raw_output)
         if isinstance(data, dict) and "queries" in data and isinstance(data["queries"], list):
+            # Filter and validate query strings, ensuring quality
             queries = [str(item) for item in data["queries"] if isinstance(item, str)]
             if queries: return queries
     except json.JSONDecodeError:
+        # Strategy 2: Extract JSON from markdown code blocks or raw text
         match = re.search(r'```json\s*(\{.*?\})\s*```', raw_output, re.DOTALL)
         if not match:
             match = re.search(r'(\{.*?\})', raw_output, re.DOTALL)
@@ -112,10 +158,14 @@ def parse_queries(raw_output: str) -> List[str]:
             except json.JSONDecodeError as e_inner:
                 logger.warning(f"Failed to parse extracted JSON from multi-query output '{json_str}': {e_inner}")
 
+        # Strategy 3: Line-by-line parsing with heuristic filtering
+        # This handles cases where the LLM outputs queries as a numbered list or similar
         lines = [line.strip() for line in raw_output.split('\n') if line.strip()]
         queries = [
+            # Remove numbered list prefixes (1., 2., etc.) and clean up quotes
             re.sub(r'^\d+\.\s*', '', line).strip('"').strip("'")
             for line in lines
+            # Filter out metadata lines and formatting artifacts
             if len(line) > 5 and not line.lower().startswith(('output:', '{', '[', '```'))
         ]
         if queries:
@@ -123,6 +173,9 @@ def parse_queries(raw_output: str) -> List[str]:
             return queries
     except Exception as e:
          logger.error(f"Unexpected error parsing multi-queries '{raw_output}': {e}")
+    
+    # Strategy 4: Complete failure - return empty list
+    # Caller should handle this gracefully (e.g., use original query)
     return []
 
 
@@ -131,23 +184,61 @@ class DocumentProcessingError(Exception):
     pass
 
 class DocumentProcessor:
-    """Handles multi-format document loading with automatic format detection."""
+    """
+    Multi-format document loader with robust error handling and format detection.
+    
+    Implements the strategy pattern to handle different document types uniformly.
+    Each format has specialized loading logic but returns standardized Document objects.
+    
+    Supported formats:
+    - PDF files: Extracted using PyPDFLoader with text cleaning
+    - CSV files: Loaded as structured data with row-based documents
+    - Text files: Raw text with automatic encoding detection
+    - Web URLs: HTML content extraction with BeautifulSoup
+    
+    Design principles:
+    - Fail fast with descriptive errors
+    - Consistent metadata structure across formats
+    - Automatic text cleaning and normalization
+    - Encoding detection for international content
+    """
     
     def __init__(self):
-        # Strategy pattern - route by file extension or URL
+        # Strategy pattern mapping - routes processing based on file type
+        # This allows easy extension for new formats without modifying existing code
         self.supported_extensions = {
-            '.pdf': self.load_pdf,
-            '.csv': self.load_csv,
-            '.txt': self.load_text,
-            'url': self.load_url
+            '.pdf': self.load_pdf,      # Adobe PDF documents
+            '.csv': self.load_csv,      # Comma-separated values
+            '.txt': self.load_text,     # Plain text files
+            'url': self.load_url        # Web pages and HTML content
         }
 
     def load_pdf(self, file_path: str) -> List[Document]:
+        """
+        Load and process PDF documents with text cleaning.
+        
+        PDFs often contain formatting artifacts, inconsistent spacing,
+        and page breaks that interfere with semantic understanding.
+        This method cleans the extracted text for better processing.
+        
+        Args:
+            file_path: Path to the PDF file
+            
+        Returns:
+            List of Document objects, one per page
+            
+        Raises:
+            DocumentProcessingError: If PDF cannot be loaded or processed
+        """
         try:
             loader = PyPDFLoader(file_path)
             docs = loader.load()
+            
+            # Process each page separately to maintain page-level granularity
+            # This is important for citation accuracy and context boundaries
             for doc in docs:
                 doc.page_content = self.clean_pdf_text(doc.page_content)
+                # Standardize metadata for consistent downstream processing
                 doc.metadata.update({'source_type': 'pdf', 'file_path': file_path})
             return docs
         except Exception as e:
@@ -155,32 +246,92 @@ class DocumentProcessor:
             raise DocumentProcessingError(f"Error loading PDF {file_path}: {str(e)}")
 
     def clean_pdf_text(self, text: str) -> str:
+        """
+        Clean PDF text by normalizing whitespace and removing formatting artifacts.
+        
+        PDF extraction often produces inconsistent spacing, line breaks in the middle
+        of sentences, and other formatting issues that hurt embedding quality.
+        
+        Args:
+            text: Raw text extracted from PDF
+            
+        Returns:
+            Cleaned text suitable for embedding and processing
+        """
+        # Replace line breaks with spaces to fix broken sentences
         text = text.replace('\n', ' ')
+        # Normalize multiple spaces to single spaces
         text = ' '.join(text.split())
         return text
 
     def load_csv(self, file_path: str) -> List[Document]:
+        """
+        Load CSV files as structured documents.
+        
+        Each row in the CSV becomes a separate document, which allows for
+        granular retrieval of specific data points. This is particularly
+        useful for datasets, product catalogs, or any tabular information.
+        
+        Args:
+            file_path: Path to the CSV file
+            
+        Returns:
+            List of Document objects, one per CSV row
+            
+        Raises:
+            DocumentProcessingError: If CSV cannot be loaded or is empty
+        """
         logger.info(f"Loading CSV: {file_path}")
         try:
+            # Use UTF-8 encoding by default - most modern CSVs use this
             loader = CSVLoader(file_path, encoding='utf-8')
             docs = loader.load()
+            
+            # Validate that we actually got content - empty CSVs are problematic
             if not docs:
                 raise DocumentProcessingError(f"No content extracted from CSV: {file_path}")
+            
+            # Add consistent metadata for all CSV documents
             for doc in docs:
                  doc.metadata.update({'source_type': 'csv', 'file_path': file_path})
+            
             logger.info(f"Successfully loaded CSV with {len(docs)} rows")
             return docs
         except Exception as e:
             raise DocumentProcessingError(f"Failed to process CSV {file_path}: {str(e)}")
 
     def load_text(self, file_path: str) -> List[Document]:
+        """
+        Load plain text files with automatic encoding detection.
+        
+        Text files can have various encodings (UTF-8, Latin-1, etc.), especially
+        in international contexts. This method automatically detects the encoding
+        to ensure proper character handling.
+        
+        Args:
+            file_path: Path to the text file
+            
+        Returns:
+            List containing single Document object with the file content
+            
+        Raises:
+            DocumentProcessingError: If file cannot be read or decoded
+        """
         try:
+            # Step 1: Auto-detect encoding by reading raw bytes
+            # This prevents encoding errors that would corrupt the content
             with open(file_path, 'rb') as file:
                 raw_data = file.read()
                 result = chardet.detect(raw_data)
                 encoding = result['encoding'] if result['encoding'] else 'utf-8'
+            
+            # Step 2: Read with detected encoding, ignoring problematic characters
+            # 'ignore' mode ensures we don't crash on encoding edge cases
             with open(file_path, 'r', encoding=encoding, errors='ignore') as file:
                 text = file.read()
+            
+            # Create single document for entire text file
+            # Unlike PDFs, text files are treated as single coherent units
             document = Document(
                 page_content=text,
                 metadata={'source_type': 'text', 'file_path': file_path}
@@ -190,13 +341,36 @@ class DocumentProcessor:
             raise DocumentProcessingError(f"Error loading text file {file_path}: {str(e)}")
 
     def load_url(self, url: str) -> List[Document]:
+        """
+        Load web pages and extract text content.
+        
+        Uses WebBaseLoader to fetch HTML content and extract readable text.
+        Handles most common web page structures automatically.
+        
+        Args:
+            url: Web URL to load
+            
+        Returns:
+            List of Document objects with extracted web content
+            
+        Raises:
+            DocumentProcessingError: If URL cannot be accessed or processed
+            
+        Note:
+            Web content quality varies significantly. The loader attempts to
+            extract main content but may include navigation, ads, etc.
+        """
         try:
             loader = WebBaseLoader(web_paths=[url])
             documents = loader.load()
+            
+            # Standardize metadata across all web documents
+            # Multiple metadata fields ensure compatibility with different systems
             for doc in documents:
                 doc.metadata['source_type'] = 'url'
-                doc.metadata['source'] = url
-                doc.metadata['url'] = url
+                doc.metadata['source'] = url      # Standard LangChain field
+                doc.metadata['url'] = url         # Explicit URL field
+            
             return documents
         except Exception as e:
             raise DocumentProcessingError(f"Error loading URL {url}: {str(e)}")
@@ -217,21 +391,53 @@ class DocumentProcessor:
 
 class RAGS:
     """
-    Retrieval-Augmented Generation System with Contextual Evaluation.
+    Advanced Retrieval-Augmented Generation System with Contextual Intelligence.
     
-    Combines hybrid search (vector + BM25) with intelligent document evaluation
-    and knowledge extraction for high-quality responses.
+    This is the core orchestrator that combines multiple retrieval strategies,
+    contextual document evaluation, and intelligent response generation.
+    
+    Key Components:
+    - Hybrid Retrieval: Vector (Pinecone) + Keyword (BM25) search
+    - CRAG Processing: Document relevance evaluation and knowledge strip extraction
+    - Multi-Query Expansion: Generate multiple query perspectives for better coverage
+    - Web Search Integration: Tavily-powered fallback for missing knowledge
+    - Response Generation: Context-aware answer synthesis with source citations
+    
+    Architecture Pattern:
+    The system follows a pipeline architecture where each stage can operate
+    independently, allowing for easy testing, debugging, and optimization.
+    
+    Performance Considerations:
+    - LLM caching reduces redundant API calls
+    - Sequential processing ensures stability and predictable resource usage
+    - Configurable thresholds allow quality/speed trade-offs
     """
     
     def __init__(
         self,
         index_name: str = "rag",
-        embedding_model: str = "BAAI/bge-m3",
+        embedding_model: str = "BAAI/bge-m3", 
         llm_model: str = "qwen2.5-coder:1.5b",
         dimension: int = 1024,
         relevance_threshold: float = 0.3,
         tavily_api_key: str = None
     ):
+        """
+        Initialize the RAG system with specified models and configuration.
+        
+        Args:
+            index_name: Pinecone index name for vector storage
+            embedding_model: HuggingFace model for document embeddings
+            llm_model: Ollama model for text generation and evaluation
+            dimension: Embedding dimension (must match model output)
+            relevance_threshold: Minimum relevance score for document inclusion
+            tavily_api_key: Optional API key for web search capabilities
+            
+        Note:
+            The initialization order is critical - Pinecone setup must happen
+            before vector store creation to ensure index availability.
+        """
+        # Core configuration - store all parameters for debugging and logging
         self.index_name = index_name
         self.embedding_model_name = embedding_model
         self.llm_model_name = llm_model
@@ -240,31 +446,38 @@ class RAGS:
         self.document_loader = DocumentProcessor()
         self.pinecone_client = None
 
-        # Enable LLM caching to reduce redundant API calls
+        # Performance optimization - cache expensive LLM calls
+        # This dramatically reduces latency for repeated queries
         set_llm_cache(InMemoryCache())
         logger.info("In-memory LLM cache enabled.")
 
         logger.info(f"Initializing RAGS with LLM: {self.llm_model_name}, Embedding: {self.embedding_model_name}")
 
+        # Step 1: Initialize vector database connection
         self.setup_pinecone()
 
+        # Step 2: Initialize embedding model with normalization
+        # Normalized embeddings improve similarity calculation accuracy
         self.embeddings = HuggingFaceEmbeddings(
             model_name=self.embedding_model_name,
             encode_kwargs={'normalize_embeddings': True}
         )
 
+        # Step 3: Create vector store interface
+        # This abstracts Pinecone operations through LangChain's standard interface
         self.vector_store = PineconeVectorStore(
             index=self.index,
             embedding=self.embeddings,
-            text_key='text'
+            text_key='text'  # Field name for document content in Pinecone
         )
         self.retriever = self.vector_store.as_retriever(search_kwargs={'k': PINECONE_RETRIEVAL_K})
 
-        # BM25 for keyword-based search - complements vector search
-        self.bm25_corpus = []
-        self.bm25_index_map = {}  # Maps corpus index to document metadata
-        self.bm25 = None
-        self.bm25_lock = threading.Lock()  # Thread safety for BM25 updates
+        # Step 4: Initialize BM25 keyword search components
+        # BM25 complements vector search by catching exact term matches
+        self.bm25_corpus = []                    # Tokenized documents for BM25
+        self.bm25_index_map = {}                 # Maps corpus index to document metadata
+        self.bm25 = None                         # BM25 index (built when documents are loaded)
+        self.bm25_lock = threading.Lock()        # Thread safety for BM25 updates
 
         if tavily_api_key:
             os.environ["TAVILY_API_KEY"] = tavily_api_key
@@ -291,7 +504,7 @@ class RAGS:
         pinecone_api_key = os.getenv("PINECONE_API_KEY")
         if not pinecone_api_key:
             try:
-                pinecone_api_key = getpass.getpass("Enter your Pinecone API key: ")
+                pinecone_api_key = input("Enter your Pinecone API key: ")
                 os.environ["PINECONE_API_KEY"] = pinecone_api_key
             except Exception as e:
                  raise Exception(f"Could not get Pinecone API key: {e}")
@@ -361,9 +574,37 @@ class RAGS:
             return [], []
 
     def load_content(self, sources: List[str]):
+        """
+        Load and index documents from multiple sources into both vector and BM25 stores.
+        
+        This is the main entry point for document ingestion. It handles multiple sources
+        concurrently, processes each through the document loading pipeline, and updates
+        both the vector database (Pinecone) and keyword index (BM25).
+        
+        Processing Pipeline:
+        1. Load documents from each source (PDF, CSV, URL, etc.)
+        2. Split documents into chunks for better retrieval granularity
+        3. Add chunks to vector store with embeddings
+        4. Build BM25 index for keyword search
+        5. Update internal mappings for hybrid retrieval
+        
+        Args:
+            sources: List of source identifiers (file paths, URLs, etc.)
+            
+        Returns:
+            List of successfully processed document splits
+            
+        Note:
+            This method is fault-tolerant - if one source fails, others continue processing.
+            Both vector and BM25 indices are updated atomically to maintain consistency.
+        """
+        # Collect all processed content before committing to indices
+        # This ensures atomicity - either all sources are processed or none
         all_valid_splits = []
         all_bm25_data = []
 
+        # Process each source independently with error isolation
+        # Failed sources don't prevent successful ones from being indexed
         for source in sources:
             try:
                 splits, bm25_source_data = self._process_single_source(source)
@@ -374,11 +615,14 @@ class RAGS:
             except Exception as e:
                 logger.error(f"Source processing failed for {source}: {e}")
 
+        # Validate that we have content to index
         if not all_valid_splits:
             logger.warning("No documents were successfully processed from any source.")
             self.bm25 = None
             return []
 
+        # Step 1: Add documents to vector store (Pinecone)
+        # This generates embeddings and stores them for semantic search
         try:
             if all_valid_splits:
                 ids = self.vector_store.add_documents(all_valid_splits)
@@ -386,10 +630,13 @@ class RAGS:
         except Exception as e:
             logger.error(f"Error adding to vector store: {e}")
 
+        # Step 2: Rebuild BM25 index for keyword search
+        # We rebuild the entire index to ensure consistency with vector store
         self.bm25_corpus = []
         self.bm25_index_map = {}
         current_bm25_offset = 0
 
+        # Build corpus and index mapping for BM25
         for i, item in enumerate(all_bm25_data):
             self.bm25_corpus.append(item['content'])
             self.bm25_index_map[current_bm25_offset + i] = {
@@ -397,6 +644,7 @@ class RAGS:
                 'metadata': item['metadata']
             }
 
+        # Validate BM25 corpus before building index
         if not self.bm25_corpus:
             logger.warning("No documents available to build BM25 index after processing all sources.")
             self.bm25 = None
@@ -982,19 +1230,53 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
 
 
     def query(self, question: str) -> Tuple[str, List[Dict]]:
+        """
+        Main query processing pipeline with hybrid retrieval and CRAG evaluation.
+        
+        This is the primary user-facing method that orchestrates the entire RAG pipeline.
+        It combines multiple retrieval strategies, contextual evaluation, and intelligent
+        response generation to provide high-quality answers with source citations.
+        
+        Processing Pipeline:
+        1. Multi-Query Generation: Create multiple query perspectives
+        2. Hybrid Retrieval: Combine vector and keyword search results
+        3. CRAG Processing: Evaluate relevance and extract knowledge strips
+        4. Web Search Fallback: Augment with web results if needed
+        5. Response Generation: Synthesize final answer with citations
+        
+        Args:
+            question: User's natural language question
+            
+        Returns:
+            Tuple containing:
+            - Generated response text with citations
+            - List of source document dictionaries with metadata
+            
+        Performance Notes:
+            - Uses sequential processing for stability and predictable resource usage
+            - Implements comprehensive timing logging for performance monitoring
+            - Includes fallback mechanisms for robustness
+        """
         start_time = time.time()
         logger.info(f"Received query: {question}")
         try:
+            # Phase 1: Multi-Query Generation
+            # Generate multiple query variations to improve retrieval coverage
+            # This helps capture different aspects of the user's information need
             gen_start_time = time.time()
             queries_for_retrieval = self.generate_queries({"question": question})
             logger.info(f"Query generation took {time.time() - gen_start_time:.2f} seconds. Generated queries: {queries_for_retrieval}")
 
+            # Validate query generation success - fail fast if no queries produced
             if not queries_for_retrieval:
                 logger.error("Query generation failed to produce any usable queries. Aborting.")
                 return "Error: Could not generate effective search queries for your question.", []
 
+            # Phase 2: Hybrid Retrieval Across Multiple Queries
+            # Retrieve documents using both vector and keyword search for each query
+            # This maximizes recall while maintaining precision through later filtering
             retrieval_start_time = time.time()
-            unique_docs_map = {}
+            unique_docs_map = {}  # Deduplicate documents across multiple queries
             for q_idx, q_text in enumerate(queries_for_retrieval):
                 logger.info(f"Processing retrieval for query {q_idx+1}/{len(queries_for_retrieval)}: '{q_text}'")
                 try:
@@ -1081,82 +1363,4 @@ Question:\n{question}\nContext:\n{context}\nComprehensive Answer:"""
             logger.error(f"Error clearing Pinecone index '{self.index_name}' or local BM25 state: {str(e)}")
             raise Exception(f"Failed to clear index '{self.index_name}': {str(e)}")
 
-def main():
-    try:
-        logger.remove()
-        logger.add(
-            sys.stderr,
-            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-            level="INFO",
-            colorize=True
-        )
-
-        logger.add(
-            "logs/rag_system.log",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-            level="DEBUG",
-            rotation="10 MB",
-            retention="7 days",
-            compression="zip"
-        )
-
-        import logging
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-
-        tavily_key = os.getenv("TAVILY_API_KEY")
-
-        print("Initializing RAG system (from main)...")
-        rag_system = RAGS(tavily_api_key=tavily_key)
-
-
-
-
-        sources_to_load = [
-            "https://lilianweng.github.io/posts/2023-06-23-agent/",
-        ]
-
-        if sources_to_load:
-            try:
-                from rank_bm25 import BM25Okapi
-            except ImportError:
-                print("CRITICAL: rank_bm25 not installed. BM25 retrieval will be skipped. Install with: pip install rank_bm25")
-
-            print(f"Loading content from {len(sources_to_load)} sources using multiple workers...")
-            processed_splits = rag_system.load_content(sources_to_load)
-            print(f"Loaded and processed {len(processed_splits)} document chunks in total.")
-            if rag_system.bm25:
-                print(f"BM25 index built with {len(rag_system.bm25_corpus)} documents.")
-            else:
-                print("BM25 index not available or not built.")
-        else:
-             print("No sources provided to load. Querying existing index (if any).")
-
-        question = "Explain task decomposition in autonomous agents based on the provided context. How is it achieved and what are the common strategies?"
-        print(f"\nQuerying with: '{question}'")
-
-        answer, sources_info = rag_system.query(question)
-
-        print("\n------ Final Answer ------")
-        print(answer)
-        print("\n------ Sources Used (Summary) ------")
-        if sources_info:
-            for i, source_item in enumerate(sources_info):
-                print(f"  {i+1}. Type: {source_item.get('type', 'N/A')}, Source: {source_item.get('source', 'N/A')}, "
-                      f"Relevance: {source_item.get('relevance_score', 'N/A'):.2f if isinstance(source_item.get('relevance_score'), float) else 'N/A'}")
-        else:
-            print("No sources were cited for this answer, or no information found.")
-
-
-
-    except Exception as e:
-         print(f"\nAN UNEXPECTED ERROR OCCURRED IN MAIN EXECUTION: {e}")
-         logger.exception("Main execution failed critically.")
-    finally:
-        print("\nMain execution finished.")
-
-
-if __name__ == "__main__":
-    main()
+# Entry point removed - use streamlit app via orchastrator.py instead

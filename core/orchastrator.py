@@ -45,70 +45,25 @@ except Exception as e:
     st.stop()
 
 def load_css():
+    """
+    Load minimal CSS styles for enhanced UI appearance.
+    
+    Provides clean, functional styling without broken CSS rules.
+    Focuses on essential layout and usability improvements.
+    """
     st.markdown("""
         <style>
-        /* Your existing CSS styles here */
         .stApp {
             max-width: 1200px;
             margin: 0 auto;
             padding: 1rem;
         }
-        .chat-container {
-            border-radius: 10px;
-            padding: 15px;
-            background-color:
-            margin: 10px 0;
-            border: 1px solid
-        }
-        .metadata-container {
-            font-size: 0.8em;
-            color:
-            margin-top: 5px;
-        }
-        .source-citation {
-            background-color:
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-size: 0.85em;
-            margin: 0 2px;
-            cursor: pointer;
-            border: 1px solid
-            display: inline-block;
-        }
-        .reference-container {
-            border-left: 3px solid
-            padding: 10px;
-            margin: 10px 0;
-            background-color:
-            border-radius: 5px;
-        }
-        .reference-header {
-            font-weight: bold;
-            color:
-            margin-bottom: 5px;
-            word-wrap: break-word;
-        }
-        .reference-content {
-            font-size: 0.9em;
-            color:
-            max-height: 150px;
-            overflow-y: auto;
-            background-color:
-            padding: 5px;
-            border-radius: 3px;
-            border: 1px solid
-        }
-        .reference-metadata {
-            font-size: 0.8em;
-            color:
-            margin-top: 5px;
+        .stTextArea textarea {
+            min-height: 100px !important;
         }
         .stSpinner > div {
             text-align: center;
             margin: 20px 0;
-        }
-        .stTextArea textarea {
-             min-height: 100px !important;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -153,7 +108,29 @@ def initialize_session_state():
 
 
 def process_and_store_documents(sources: List[str]) -> int:
-    """Process documents and store them in the RAG system. Returns number of chunks processed."""
+    """
+    Process and ingest documents into the RAG system with comprehensive error handling.
+    
+    This function handles the document ingestion pipeline including loading,
+    chunking, embedding generation, and storage in both vector and keyword indices.
+    
+    Args:
+        sources: List of document sources (file paths, URLs, etc.)
+        
+    Returns:
+        Number of document chunks successfully processed and stored
+        
+    Error Handling:
+    - Validates RAG system initialization
+    - Handles individual source failures gracefully
+    - Provides user feedback through Streamlit interface
+    - Updates session state with processed sources
+    
+    Side Effects:
+    - Updates st.session_state.document_sources with new sources
+    - Modifies RAG system's internal vector and BM25 indices
+    - Displays progress and status messages to user
+    """
     if 'rag_system' not in st.session_state:
         st.error("RAG system not initialized.")
         return 0
