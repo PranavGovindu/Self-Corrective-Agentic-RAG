@@ -15,6 +15,7 @@ dependencies = [
     "langchain-ollama>=0.3.7",
     "langchain-pinecone>=0.2.12",
     "langchain-text-splitters>=0.3.11",
+    "loguru>=0.7.3",
     "numpy<2",
     "pandas>=2.3.2",
     "pinecone-client>=6.0.0",

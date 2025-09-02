@@ -1,19 +1,15 @@
 import os
 import getpass
 
-# Pinecone Configuration
-PINECONE_API_KEY = "your-pinecone-api-key"  # Replace with your key
+PINECONE_API_KEY = "your-pinecone-api-key"
 INDEX_NAME = "rag"
 DIMENSION = 1024
 
-# Model Configuration
 EMBEDDING_MODEL = "BAAI/bge-m3"
-LLM_MODEL = "qwen2.5-coder:1.5b"  # Ollama model name
+LLM_MODEL = "qwen2.5-coder:1.5b"
 
-# Tavily Configuration
-TAVILY_API_KEY = "your-tavily-api-key"  # Replace with your key
+TAVILY_API_KEY = "your-tavily-api-key"
 
-# Retrieval Configuration
 RELEVANCE_THRESHOLD = 0.3
 
 def setup_environment():
